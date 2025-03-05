@@ -36,18 +36,26 @@ void makeIntegratingSphere1Ray( )
     world->AddNode(mirror, 1);
     manager->SetNsegments(100);
     manager->CloseGeometry();
-    gGeoManager->GetTopVolume()->Draw("ogl");
-//    ARay* ray = new ARay(0, 400*nm, 30*cm, 20*cm, -40*cm, 0, 5, -9, -2);
-//    ARay* ray = new ARay(0, 400*nm, 30*cm, 20*cm, -40*cm, 0, 0, 0, -9);
+
+    // Create and get canvas explicitly
+    TCanvas* can = new TCanvas("can3D", "Integrating Sphere with Ray", 800, 800);
+    can->cd();  // Make this the active canvas
+    
+    // Draw geometry first
+    world->Draw("ogl");  // Use world instead of gGeoManager->GetTopVolume()
+    
+    // Create and trace ray
     ARay* ray = new ARay(0, 400*nm, -60*cm, 0*cm, -80*cm, 0, 5, 0, 0);
     manager->TraceNonSequential(*ray);
     TPolyLine3D* pol = ray->MakePolyLine3D();
-//    pol->SetLineWidth(3);
     pol->SetLineWidth(1);
     pol->SetLineColor(2);
-//    TCanvas* can = new TCanvas("can3D", "can3D", 800, 800);
-//    can->cd();
-//    world->Draw("ogl");
-    pol->Draw();
-//    delete ray;
+    
+    // Draw ray in same view
+    pol->Draw("same");
+    
+    // Update canvas
+    can->Update();
+    
+    // Optional: delete ray;
 }
