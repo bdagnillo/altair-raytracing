@@ -24,6 +24,14 @@
 #include <cmath>
 #include <iomanip>
 #include <random>
+#include "TRandom.h"
+#include "TMath.h"
+#include "TVector3.h"
+#include "TGeoManager.h"
+#include "AOpticsManager.h"
+#include "AMirror.h"
+#include "ARay.h"
+#include <fstream>
 
 const double cm = AOpticsManager::cm();
 const double nm = AOpticsManager::nm();
@@ -38,22 +46,8 @@ class ReflectiveSurface {
 public:
     ReflectiveSurface(BRDFModel model, double albedo) : brdfModel(model), albedo(albedo) {}
 
-    double computeBRDF(const TVector3& incoming, const TVector3& outgoing, const TVector3& normal) const {
-        switch (brdfModel) {
-            case OREN_NAYAR:
-                return orenNayarBRDF(incoming, outgoing, normal);
-            case COOK_TORRANCE:
-                return cookTorranceBRDF(incoming, outgoing, normal);
-            default:
-                return 0.0;
-        }
-    }
-
-private:
-    BRDFModel brdfModel;
-    double albedo;
-
-    TVector3 sampleHemisphereCosine(double u1, double u2, const TVector3& normal) {
+    // Move this to public section
+    TVector3 sampleHemisphereCosine(double u1, double u2, const TVector3& normal) const {
         // Concentric disk mapping for better distribution
         double r = sqrt(u1);
         double theta = 2.0 * M_PI * u2;
@@ -71,7 +65,33 @@ private:
         // Transform sample from local to world space
         return (x * tangent + y * bitangent + z * normal).Unit();
     }
-    
+
+    double computeBRDF(const TVector3& incoming, const TVector3& outgoing, const TVector3& normal) const {
+        switch (brdfModel) {
+            case OREN_NAYAR:
+                return orenNayarBRDF(incoming, outgoing, normal);
+            case COOK_TORRANCE:
+                return cookTorranceBRDF(incoming, outgoing, normal);
+            default:
+                return 0.0;
+        }
+    }
+
+    // Add static helper for ray operations
+    static TVector3 getRayDirection(const ARay* ray) {
+        Double_t dir[3];
+        ray->GetDirection(dir);
+        return TVector3(dir[0], dir[1], dir[2]).Unit();
+    }
+
+    static void setRayDirection(ARay& ray, const TVector3& direction) {
+        ray.SetDirection(direction.X(), direction.Y(), direction.Z());
+    }
+
+private:
+    BRDFModel brdfModel;
+    double albedo;
+
     double monteCarloIntegration(const TVector3& outgoing, const TVector3& normal, 
                             int numSamples, std::function<double(const TVector3&, const TVector3&, const TVector3&)> brdfFunc) {
         double result = 0.0;
@@ -155,6 +175,50 @@ private:
         static std::mt19937 gen(rd());
         static std::uniform_real_distribution<> dis(0.0, 1.0);
         return dis(gen);
+    }
+};
+
+// Replace BRDFSurfaceCondition with CustomMirror usage
+class CustomBRDFMirror : public AMirror {
+private:
+    BRDFModel brdfModel;
+    double albedo;
+
+public:
+    CustomBRDFMirror(const char* name, TGeoShape* shape, BRDFModel model, double a) 
+        : AMirror(name, shape), brdfModel(model), albedo(a) {}
+
+    virtual Bool_t Reflect(ARay& ray, TVector3& normal) {
+        // Get incoming direction safely
+        Double_t dir[3] = {0};  // Initialize array
+        ray.GetDirection(dir);
+        TVector3 incoming(dir[0], dir[1], dir[2]);
+        
+        // Ensure normal is normalized
+        normal = normal.Unit();
+        
+        // Generate random numbers for sampling
+        double u1 = gRandom->Uniform(0, 1);
+        double u2 = gRandom->Uniform(0, 1);
+        
+        // Create surface and sample direction
+        ReflectiveSurface surface(brdfModel, albedo);
+        TVector3 outgoing = surface.sampleHemisphereCosine(u1, u2, normal);
+        
+        // Ensure outgoing vector is normalized
+        outgoing = outgoing.Unit();
+        
+        // Set new direction safely
+        ray.SetDirection(outgoing.X(), outgoing.Y(), outgoing.Z());
+        
+        // Add point to continue ray path safely
+        Double_t pos[3] = {0};  // Initialize array
+        ray.GetLastPoint(pos);
+        
+        // Simply add the point - ARay handles its own point limit
+        ray.AddPoint(pos[0], pos[1], pos[2], ray.GetNpoints());
+        
+        return true;
     }
 };
 
@@ -275,19 +339,44 @@ struct Detector {
 };
 
 void setupOpticsManager(AOpticsManager* manager, BRDFModel brdfModel, double albedo) {
+    if (!manager) return;
+    
+    // Properly clean up existing geometry
+    if (gGeoManager) {
+        gGeoManager->Clear();
+        gGeoManager->SetTopVolume(nullptr);
+    }
+    
+    // Set proper limits for ray tracing
     manager->SetLimit(10000);
-    TGeoBBox* box = new TGeoBBox("box", 200*cm, 200*cm, 200*cm);
+    // manager->SetMaxDepth(100);
+    
+    // Create world volume with adequate size and medium
+    TGeoBBox* box = new TGeoBBox("box", 300*cm, 300*cm, 300*cm);
     AOpticalComponent* world = new AOpticalComponent("world", box);
     manager->SetTopVolume(world);
+    
+    // Create mirror with BRDF
     TGeoSphere* sphere = new TGeoSphere("sphereWithExitPort", 100.1*cm, 101*cm, 0., thetaMax);
-    AMirror* mirror = new AMirror("mirror", sphere);
-    ABorderSurfaceCondition* condition = new ABorderSurfaceCondition(world, mirror);
-    condition->EnableLambertian(false); // Disable Lambertian reflection
-    ReflectiveSurface reflectiveSurface(brdfModel, albedo);
-    // Use reflectiveSurface.computeBRDF() in the ray tracing logic
-    world->AddNode(mirror, 1);
+    if (!sphere) return;
+    
+    CustomBRDFMirror* mirror = new CustomBRDFMirror("mirror", sphere, brdfModel, albedo);
+    if (!mirror) return;
+    
+    // Add mirror to world with proper matrix
+    TGeoRotation* rot = new TGeoRotation();
+    TGeoTranslation* trans = new TGeoTranslation(0, 0, 0);
+    TGeoCombiTrans* matrix = new TGeoCombiTrans(*trans, *rot);
+    world->AddNode(mirror, 1, matrix);
+    
+    // Configure geometry settings
     manager->SetNsegments(100);
-    manager->CloseGeometry();
+    manager->SetMaxVisNodes(10000);
+    
+    // Close geometry only once
+    if (!manager->IsClosed()) {
+        manager->CloseGeometry();
+    }
 }
 
 bool isRayPassingThroughExitPort(ARay* ray, double exitPortZ) {
@@ -442,45 +531,49 @@ void sweepDetector(BRDFModel brdfModel, double albedo) {
 }
 
 void visualizeDetector(double theta = 0.0, double phi = 0.0, BRDFModel brdfModel = COOK_TORRANCE, double albedo = 0.9) {
+    // Create and configure manager first
+    AOpticsManager* manager = new AOpticsManager("manager", "spherical shell");
+    setupOpticsManager(manager, brdfModel, albedo);
+    
     // Create canvas with square proportions
     TCanvas* c = new TCanvas("cvis", "Detector Visualization", 800, 800);
     c->cd();
     
-    AOpticsManager* manager = new AOpticsManager("manager", "spherical shell");
-    setupOpticsManager(manager, brdfModel, albedo);
-    
-    // Create and position detector first
+    // Create and position detector
     Detector detector(20*cm, 20*cm);
     detector.setPosition(theta, phi, 100*cm);
     
-    // Get the world volume and configure it
-    TGeoVolume* world = gGeoManager->GetTopVolume();
+    // Configure world volume
+    TGeoVolume* world = manager->GetTopVolume();
+    if (!world) return;
+    
     world->SetLineColor(kGray);
     world->SetTransparency(80);
     
     // Add detector to geometry
     detector.AddToGeometry(world);
     
-    // Initialize geometry first
-    gGeoManager->CloseGeometry();
+    // Ensure geometry is properly closed
+    if (!manager->IsClosed()) {
+        manager->CloseGeometry();
+    }
     
-    // Set up the 3D viewer
+    // Set up GL viewer
     gStyle->SetCanvasPreferGL(true);
     world->Draw("ogl");
     
-    // Get viewer and set initial properties
     TGLViewer* glv = (TGLViewer*)gPad->GetViewer3D();
     if (glv) {
         glv->SetStyle(TGLRnrCtx::kWireFrame);
         glv->SetDrawOption(""); 
     }
     
-    // Draw rays after geometry is initialized
-    int n = 1000;  // Increased for better visualization
+    // Trace rays with proper cleanup
+    int n = 1000;
     double exitPortZ = -100*cm;
     int hitCount = traceRays(manager, n, exitPortZ, detector, true);
     
-    // Final viewer updates
+    // Update viewer
     if (glv) {
         glv->DrawGuides();
         glv->UpdateScene();
@@ -488,14 +581,11 @@ void visualizeDetector(double theta = 0.0, double phi = 0.0, BRDFModel brdfModel
     }
     
     c->Update();
-    c->Modified();
-    gPad->Modified();
-    gPad->Update();
     
     // Print detector information
-    cout << "\nDetector Information:" << endl;
-    cout << "Position (x,y,z): (" << detector.x/cm << ", " << detector.y/cm << ", " << detector.z/cm << ") cm" << endl;
-    cout << "Normal vector (nx,ny,nz): (" << detector.nx << ", " << detector.ny << ", " << detector.nz << ")" << endl;
-    cout << "Angular position: theta = " << theta << "°, phi = " << phi << "°" << endl;
-    cout << "Number of rays hitting the detector: " << hitCount << endl;
+    std::cout << "\nDetector Information:" << std::endl;
+    std::cout << "Position (x,y,z): (" << detector.x/cm << ", " 
+              << detector.y/cm << ", " << detector.z/cm << ") cm" << std::endl;
+    std::cout << "Angular position: theta = " << theta << "°, phi = " << phi << "°" << std::endl;
+    std::cout << "Rays hitting detector: " << hitCount << "/" << n << std::endl;
 }
