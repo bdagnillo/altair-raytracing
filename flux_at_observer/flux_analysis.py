@@ -28,11 +28,16 @@ plt.figure(figsize=(10, 6))
 plt.scatter(theta_values, fraction_means, color='blue', alpha=0.5, label='Data (mean values)')
 plt.plot(theta_smooth, fit_curve, 'r-', label=f'Fit: {popt[0]:.3f}*cos({popt[1]:.3f}θ) + {popt[2]:.3f}')
 
+# Calculate step sizes
+theta_step = np.diff(theta_values).mean()
+phi_step = 360 / len(data[data['theta'] == theta_values[0]])  # Assuming phi goes from 0 to 360
+
 plt.xlabel('θ (degrees)')
 plt.ylabel('Fraction')
-plt.title('Flux Fraction vs Theta with Cosine Fit')
+plt.title('Flux Fraction vs Theta with Cosine Fit for 100k rays\n' + 
+         f'Steps: Δθ = {theta_step:.1f}°, Δφ = {phi_step:.1f}°')
 plt.legend()
 plt.grid(True)
-
+plt.savefig('flux_fraction_vs_theta.png')
 # Show the plot
 plt.show()

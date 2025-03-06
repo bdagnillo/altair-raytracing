@@ -28,6 +28,47 @@ const double cm = AOpticsManager::cm();
 const double nm = AOpticsManager::nm();
 const double thetaMax = 170.;     // governs size of exit port
 
+double calculateScatteringProbability(const TVector3& direction, const TVector3& normal) {
+    double cosTheta = direction.Dot(normal);
+    const double n = 2.0;  // Reduced from 5.0 to make scattering more visible
+    double probability = pow(std::abs(cosTheta), n);
+    return probability;
+}
+
+TVector3 generateScatteredDirection(const TVector3& incident, const TVector3& normal) {
+    // Use a wider angle for more visible scattering
+    const double maxAngle = 60.0 * TMath::Pi() / 180.0; // Increased from 45° to 60°
+    
+    // Create a local coordinate system based on the normal
+    TVector3 w = normal.Unit();
+    TVector3 u = TVector3(0, 1, 0).Cross(w).Unit();
+    TVector3 v = w.Cross(u);
+    
+    while (true) {
+        // Generate random angles with cosine weighting
+        double r1 = (double)rand() / RAND_MAX;
+        double r2 = (double)rand() / RAND_MAX;
+        
+        double theta = maxAngle * r1;  // Linear distribution in theta
+        double phi = 2.0 * TMath::Pi() * r2;
+        
+        // Convert to cartesian coordinates
+        double x = sin(theta) * cos(phi);
+        double y = sin(theta) * sin(phi);
+        double z = cos(theta);
+        
+        // Transform to world space
+        TVector3 scattered = x*u + y*v + z*w;
+        scattered = scattered.Unit();
+        
+        // Accept/reject based on our probability distribution
+        double p = calculateScatteringProbability(scattered, normal);
+        if ((double)rand() / RAND_MAX <= p) {
+            return scattered;
+        }
+    }
+}
+
 struct Detector {
     double x, y, z;           // position
     double nx, ny, nz;        // normal vector
@@ -144,82 +185,64 @@ struct Detector {
     }
 };
 
-class BRDF {
-private:
-    double m_roughness; // Surface roughness parameter (0 = perfect mirror, 1 = fully diffuse)
-    double m_specular;  // Specular reflection coefficient
-    double m_diffuse;   // Diffuse reflection coefficient
-
+class NonLambertianSurface : public ABorderSurfaceCondition {
 public:
-    BRDF(double roughness = 0.5, double specular = 0.3, double diffuse = 0.7) 
-        : m_roughness(roughness), m_specular(specular), m_diffuse(diffuse) {
-        // Ensure coefficients sum to 1
-        double sum = m_specular + m_diffuse;
-        m_specular /= sum;
-        m_diffuse /= sum;
-    }
-
-    TVector3 SampleDirection(const TVector3& normal, const TVector3& incident) {
-        // Decide between specular and diffuse reflection
-        if (gRandom->Uniform() < m_specular) {
-            return SampleSpecular(normal, incident);
-        } else {
-            return SampleDiffuse(normal);
+    NonLambertianSurface(AOpticalComponent* comp1, AOpticalComponent* comp2) 
+        : ABorderSurfaceCondition(comp1, comp2) {}
+    
+    virtual bool Reflection(ARay& ray, const TVector3& normal) {
+        // Debug output
+        std::cout << "NonLambertianSurface::Reflection called" << std::endl;
+        
+        // Get incident direction
+        Double_t dir[3];
+        ray.GetDirection(dir);
+        TVector3 incident(dir[0], dir[1], dir[2]);
+        
+        // Print incident and normal directions
+        std::cout << "Incident: (" << dir[0] << ", " << dir[1] << ", " << dir[2] << ")" << std::endl;
+        std::cout << "Normal: (" << normal.X() << ", " << normal.Y() << ", " << normal.Z() << ")" << std::endl;
+        
+        // Generate scattered direction
+        TVector3 scattered = generateScatteredDirection(incident, normal);
+        
+        // Ensure the scattered direction is in the correct hemisphere
+        if (scattered.Dot(normal) < 0) {
+            scattered = -scattered;
         }
-    }
-
-private:
-    TVector3 SampleSpecular(const TVector3& normal, const TVector3& incident) {
-        // Perfect mirror reflection direction
-        TVector3 reflect = incident - 2 * incident.Dot(normal) * normal;
-        reflect.SetMag(1.0);
-
-        // Add perturbation based on roughness
-        double theta = gRandom->Gaus(0, m_roughness * M_PI/6); // Max 30° deviation at 1.0 roughness
-        double phi = gRandom->Uniform(0, 2*M_PI);
-
-        // Create perturbation vector perpendicular to reflection
-        TVector3 perp1 = reflect.Orthogonal();
-        TVector3 perp2 = reflect.Cross(perp1);
         
-        // Apply perturbation
-        TVector3 result = reflect + sin(theta)*(cos(phi)*perp1 + sin(phi)*perp2);
-        result.SetMag(1.0);
-        return result;
-    }
-
-    TVector3 SampleDiffuse(const TVector3& normal) {
-        // Sample cosine-weighted hemisphere distribution
-        double theta = acos(sqrt(gRandom->Uniform()));  // Cosine-weighted
-        double phi = gRandom->Uniform(0, 2*M_PI);
+        // Print scattered direction
+        std::cout << "Scattered: (" << scattered.X() << ", " << scattered.Y() << ", " << scattered.Z() << ")" << std::endl;
         
-        // Create local coordinate system
-        TVector3 u = normal.Orthogonal();
-        TVector3 v = normal.Cross(u);
-        
-        // Convert spherical to cartesian coordinates in local system
-        double x = sin(theta) * cos(phi);
-        double y = sin(theta) * sin(phi);
-        double z = cos(theta);
-        
-        // Transform to world coordinates
-        return (x * u + y * v + z * normal).Unit();
+        // Set the new direction
+        ray.SetDirection(scattered.X(), scattered.Y(), scattered.Z());
+        return true;
     }
 };
 
-// Add this to the global scope, before the traceRays function
-BRDF gBRDF(0.3, 0.4, 0.6); // Default parameters for surface properties
-
 void setupOpticsManager(AOpticsManager* manager) {
     manager->SetLimit(10000);
+    
+    // Create world volume with transparent vacuum
     TGeoBBox* box = new TGeoBBox("box", 200*cm, 200*cm, 200*cm);
     AOpticalComponent* world = new AOpticalComponent("world", box);
+    world->SetMedium(world->GetTransparentVacuumMedium());
     manager->SetTopVolume(world);
+    
+    // Create mirror with opaque vacuum
     TGeoSphere* sphere = new TGeoSphere("sphereWithExitPort", 100.1*cm, 101*cm, 0., thetaMax);
     AMirror* mirror = new AMirror("mirror", sphere);
-    ABorderSurfaceCondition* condition = new ABorderSurfaceCondition(world, mirror);
+    mirror->SetMedium(world->GetOpaqueVacuumMedium());
+    
+    // Create and set the non-Lambertian surface condition
+    NonLambertianSurface* condition = new NonLambertianSurface(world, mirror);
     condition->EnableLambertian(false);
+    world->AddBorderSurfaceCondition(condition);
+    
+    // Add mirror to world
     world->AddNode(mirror, 1);
+    
+    // Set geometry parameters and close
     manager->SetNsegments(100);
     manager->CloseGeometry();
 }
@@ -230,74 +253,38 @@ bool isRayPassingThroughExitPort(ARay* ray, double exitPortZ) {
     return lastPoint[2] < exitPortZ;
 }
 
-// Modify the traceRays function
+// Fix traceRays function to update detector's hit count
 int traceRays(AOpticsManager* manager, int n, double exitPortZ, Detector& detector, bool drawRays = false) {
-    std::vector<TPolyLine3D*> rays;
-    int hitCount = 0;
-    
-    // Add random number generator initialization
-    gRandom->SetSeed();
+    std::vector<TPolyLine3D*> rays;  // Store rays for visualization
+    int hitCount = 0;  // Count of rays hitting the detector
     
     for (int i = 0; i < n; ++i) {
         double x = -60*cm;
         ARay* ray = new ARay(0, 400*nm, x, 0*cm, -80*cm, 0, 5, 0, 0);
-        
-        // Get initial direction for later use
-        Double_t initDir[3];
-        ray->GetDirection(initDir);
-        TVector3 incidentDir(initDir[0], initDir[1], initDir[2]);
-        
         manager->TraceNonSequential(*ray);
         
-        // Get final position and normal at reflection point
-        Double_t lastPoint[3];
-        ray->GetLastPoint(lastPoint);
-        TVector3 reflectionPoint(lastPoint[0], lastPoint[1], lastPoint[2]);
-        
-        // Calculate surface normal at reflection point (simplified - assumes spherical mirror)
-        TVector3 normal = reflectionPoint.Unit();
-        
-        // Generate new direction using BRDF
-        TVector3 newDir = gBRDF.SampleDirection(normal, incidentDir);
-        
-        // Create new ray from reflection point with new direction
-        ARay* scatteredRay = new ARay(0, 400*nm, 
-                                     reflectionPoint.X(), reflectionPoint.Y(), reflectionPoint.Z(),
-                                     0, newDir.X(), newDir.Y(), newDir.Z());
-        manager->TraceNonSequential(*scatteredRay);
-        
         if (drawRays) {
-            // Draw both initial and scattered rays
-            TPolyLine3D* pol1 = ray->MakePolyLine3D();
-            TPolyLine3D* pol2 = scatteredRay->MakePolyLine3D();
-            
-            if (isRayPassingThroughExitPort(scatteredRay, exitPortZ) && 
-                detector.checkIntersection(scatteredRay)) {
-                pol1->SetLineColor(kBlue);   // Initial ray that leads to detection
-                pol2->SetLineColor(kGreen);  // Scattered ray that hits detector
-                detector.hitCount++;
+            TPolyLine3D* pol = ray->MakePolyLine3D();
+            if (isRayPassingThroughExitPort(ray, exitPortZ) && 
+                detector.checkIntersection(ray)) {
+                pol->SetLineColor(kGreen);  // Hits detector
+                detector.hitCount++;  // Update detector's counter
                 hitCount++;
-            } else if (isRayPassingThroughExitPort(scatteredRay, exitPortZ)) {
-                pol1->SetLineColor(kGray);   // Initial ray
-                pol2->SetLineColor(kYellow); // Scattered ray through exit port
+            } else if (isRayPassingThroughExitPort(ray, exitPortZ)) {
+                pol->SetLineColor(kYellow);  // Passes through exit port but misses detector
             } else {
-                pol1->SetLineColor(kGray);   // Initial ray
-                pol2->SetLineColor(kRed);    // Scattered ray misses
+                pol->SetLineColor(kRed);    // Doesn't pass through exit port
             }
-            pol1->SetLineWidth(1);
-            pol2->SetLineWidth(1);
-            pol1->Draw();
-            pol2->Draw();
-            rays.push_back(pol1);
-            rays.push_back(pol2);
-        } else if (isRayPassingThroughExitPort(scatteredRay, exitPortZ) && 
-                   detector.checkIntersection(scatteredRay)) {
-            detector.hitCount++;
+            pol->SetLineWidth(2);
+            pol->Draw();
+            rays.push_back(pol);  // Store for later cleanup if needed
+        } else if (isRayPassingThroughExitPort(ray, exitPortZ) && 
+                   detector.checkIntersection(ray)) {
+            detector.hitCount++;  // Update detector's counter
             hitCount++;
         }
 
         delete ray;
-        delete scatteredRay;
     }
     return hitCount;
 }
@@ -420,7 +407,7 @@ void visualizeDetector(double theta = 45.0, double phi = 0.0) {
     }
     
     // Draw rays after geometry is initialized
-    int n = 1000;  // Increased for better visualization
+    int n = 100;  // Increased for better visualization
     double exitPortZ = -100*cm;
     int hitCount = traceRays(manager, n, exitPortZ, detector, true);
     
