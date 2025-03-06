@@ -22,6 +22,7 @@
 #include "ARayShooter.h"
 #include <iostream>
 #include <cmath>
+#include <iomanip>
 
 const double cm = AOpticsManager::cm();
 const double nm = AOpticsManager::nm();
@@ -46,76 +47,93 @@ struct Detector {
      * @param radius: distance from exit port center
      */
     void setPosition(double theta, double phi, double radius) {
-        // Convert spherical to cartesian coordinates (relative to exit port at z=-100cm)
+        // Convert spherical to cartesian coordinates
         double theta_rad = theta * M_PI / 180.0;
         double phi_rad = phi * M_PI / 180.0;
         
-        // Calculate position relative to exit port
+        // Calculate position relative to world origin
         x = radius * sin(theta_rad) * cos(phi_rad);
         y = radius * sin(theta_rad) * sin(phi_rad);
-        z = -100*cm - radius * cos(theta_rad);
+        z = -100*cm - radius * cos(theta_rad);  // Offset by exit port position
         
-        // Normal vector always points to exit port center
-        double dx = x;
-        double dy = y;
-        double dz = z + 100*cm;  // relative to exit port
+        // Calculate normal vector pointing to (0,0,-100)
+        double dx = x - 0;
+        double dy = y - 0;
+        double dz = z - (-100*cm);
         double mag = sqrt(dx*dx + dy*dy + dz*dz);
         
-        nx = -dx/mag;  // Negative because we want to point towards the source
-        ny = -dy/mag;
-        nz = -dz/mag;
+        nx = -dy/mag;  // Negative because we want to point towards the exit port
+        ny = dx/mag;
+        nz = dz/mag;
     }
     
     bool checkIntersection(const ARay* ray) {
         Double_t lastPoint[3];
         Double_t direction[3];
         ray->GetLastPoint(lastPoint);
-        ray->GetDirection(direction); // Using GetDirection instead of GetLastStatus
+        ray->GetDirection(direction);
         
-        // Check if ray intersects detector plane
-        double dx = lastPoint[0] - x;
+        // Calculate dot product of ray direction with detector normal
+        double dot = direction[0]*nx + direction[1]*ny + direction[2]*nz;
+        if (fabs(dot) < 1e-10) return false;  // Ray is parallel to detector plane
+        
+        // Calculate intersection with detector plane
+        double dx = lastPoint[0] - x;  // Changed sign: point - center
         double dy = lastPoint[1] - y;
         double dz = lastPoint[2] - z;
         
-        double dot = direction[0]*nx + direction[1]*ny + direction[2]*nz;
-        if (dot >= 0) return false;  // Ray moving away from detector
+        // Distance along ray to intersection point
+        double t = -(dx*nx + dy*ny + dz*nz) / dot;  // Added negative sign
         
         // Calculate intersection point
-        double t = -(dx*nx + dy*ny + dz*nz) / dot;
         double ix = lastPoint[0] + direction[0] * t;
         double iy = lastPoint[1] + direction[1] * t;
         double iz = lastPoint[2] + direction[2] * t;
         
-        // Check if intersection point is within detector bounds
-        double local_x = (ix - x)*nx + (iy - y)*ny + (iz - z)*nz;
-        double local_y = -(ix - x)*ny + (iy - y)*nx;
+        // Vector from detector center to intersection point
+        double rx = ix - x;
+        double ry = iy - y;
+        double rz = iz - z;
         
-        return (fabs(local_x) <= width/2 && fabs(local_y) <= height/2);
+        // Compute distance in detector plane
+        // Using cross product with normal to get perpendicular components
+        double ux = ny*rz - nz*ry;  // First perpendicular direction
+        double uy = nz*rx - nx*rz;
+        double uz = nx*ry - ny*rx;
+        
+        double r2 = ux*ux + uy*uy + uz*uz;  // Square of distance in detector plane
+        
+        return r2 <= (width/2)*(width/2);
     }
 
     TGeoVolume* CreateGeometry() const {
-        // Create a thicker box to represent the detector
-        TGeoBBox* detBox = new TGeoBBox("detBox", 
-            width/2,    // half-width in x
-            height/2,   // half-height in y
-            2*cm        // Make it thicker for better visibility
+        // Create a disk instead of a box
+        TGeoTube* detDisk = new TGeoTube("detDisk", 
+            0,           // inner radius
+            width/2,     // outer radius (using width as diameter)
+            1*cm         // half-length in z (thickness)
         );
-        TGeoVolume* detVol = new TGeoVolume("detector", detBox);
+        TGeoVolume* detVol = new TGeoVolume("detector", detDisk);
         detVol->SetLineColor(kBlue);
         detVol->SetLineWidth(2);
-        detVol->SetFillColor(kCyan);          // Brighter color
-        detVol->SetTransparency(20);          // More opaque
+        detVol->SetFillColor(kCyan);
+        detVol->SetTransparency(20);
         return detVol;
     }
     
     void AddToGeometry(TGeoVolume* top) const {
         TGeoVolume* detVol = CreateGeometry();
         
-        // Create rotation matrix to align detector normal
-        // First, calculate rotation angles
-        double phi_rot = atan2(ny, nx) * 180/M_PI;
-        double theta_rot = acos(nz) * 180/M_PI;
+        // Calculate rotation matrix to point detector normal to exit port
+        // We need to rotate from the default orientation (normal along z-axis)
+        // to point towards (0,0,-100)
         
+        // First convert normal vector to spherical coordinates
+        double theta_rot = acos(-nz) * 180/M_PI;  // Note the negative nz
+        double phi_rot = atan2(-ny, -nx) * 180/M_PI;  // Note the negatives
+        
+        // Create rotation that first rotates around Y axis (theta)
+        // then around Z axis (phi)
         TGeoRotation* rot = new TGeoRotation();
         rot->SetAngles(phi_rot, theta_rot, 0);
         
@@ -146,36 +164,53 @@ bool isRayPassingThroughExitPort(ARay* ray, double exitPortZ) {
     return lastPoint[2] < exitPortZ;
 }
 
-void traceRays(AOpticsManager* manager, int n, double exitPortZ, Detector& detector) {
+// Fix traceRays function to update detector's hit count
+int traceRays(AOpticsManager* manager, int n, double exitPortZ, Detector& detector, bool drawRays = false) {
+    std::vector<TPolyLine3D*> rays;  // Store rays for visualization
+    int hitCount = 0;  // Count of rays hitting the detector
+    
     for (int i = 0; i < n; ++i) {
         double x = -60*cm;
         ARay* ray = new ARay(0, 400*nm, x, 0*cm, -80*cm, 0, 5, 0, 0);
         manager->TraceNonSequential(*ray);
-        TPolyLine3D* pol = ray->MakePolyLine3D();
-        pol->SetLineWidth(1);
-        pol->SetLineColor(2);
-        pol->Draw();
         
-        if (isRayPassingThroughExitPort(ray, exitPortZ) && 
-            detector.checkIntersection(ray)) {
-            detector.hitCount++;
+        if (drawRays) {
+            TPolyLine3D* pol = ray->MakePolyLine3D();
+            if (isRayPassingThroughExitPort(ray, exitPortZ) && 
+                detector.checkIntersection(ray)) {
+                pol->SetLineColor(kGreen);  // Hits detector
+                detector.hitCount++;  // Update detector's counter
+                hitCount++;
+            } else if (isRayPassingThroughExitPort(ray, exitPortZ)) {
+                pol->SetLineColor(kYellow);  // Passes through exit port but misses detector
+            } else {
+                pol->SetLineColor(kRed);    // Doesn't pass through exit port
+            }
+            pol->SetLineWidth(2);
+            pol->Draw();
+            rays.push_back(pol);  // Store for later cleanup if needed
+        } else if (isRayPassingThroughExitPort(ray, exitPortZ) && 
+                   detector.checkIntersection(ray)) {
+            detector.hitCount++;  // Update detector's counter
+            hitCount++;
         }
 
         delete ray;
     }
-    std::cout << "Rays hitting detector: " << detector.hitCount << std::endl;
+    return hitCount;
 }
 
+// Fix fraction calculation in sweepDetector
 void sweepDetector() {
     AOpticsManager* manager = new AOpticsManager("manager", "spherical shell");
     setupOpticsManager(manager);
 
-    int n = 1000; // reduced number of rays per point for faster sweep
+    int n = 100000; // reduced number of rays per point for faster sweep
     double exitPortZ = -100*cm;
     
     // Create 2D histogram for the angular sweep
     const int nThetaBins = 45;  // 2-degree steps in theta
-    const int nPhiBins = 30;    // 5-degree steps in phi
+    const int nPhiBins = 20;    // 5-degree steps in phi
     TH2D* fluxMap = new TH2D("fluxMap", "Detector Flux Map;#theta (deg);#phi (deg)", 
                             nThetaBins, 0, 90, nPhiBins, 0, 360);
     
@@ -183,6 +218,10 @@ void sweepDetector() {
     Detector detector;
     
     // Perform the sweep
+    std::cout << "\nStarting detector sweep..." << std::endl;
+    std::cout << "Format: theta(°), phi(°): hits/total = fraction" << std::endl;
+    std::cout << "----------------------------------------" << std::endl;
+    
     for(int i = 0; i < nThetaBins; i++) {
         double theta = (i + 0.5) * 90.0/nThetaBins;
         for(int j = 0; j < nPhiBins; j++) {
@@ -193,12 +232,19 @@ void sweepDetector() {
             
             traceRays(manager, n, exitPortZ, detector);
             
-            // Fill histogram with normalized counts
-            fluxMap->SetBinContent(i+1, j+1, double(detector.hitCount)/n);
+            // Fix fraction calculation
+            double fraction = double(detector.hitCount)/double(n);
+            fluxMap->SetBinContent(i+1, j+1, fraction);
             
-            // Progress update
-            std::cout << "Completed theta = " << theta << "°, phi = " << phi << "°" << std::endl;
+            // Detailed progress update
+            std::cout << std::fixed << std::setprecision(1)
+                     << theta << "°, " << phi << "°: "
+                     << detector.hitCount << "/" << n << " = "
+                     << std::setprecision(8) << fraction
+                     << std::endl;
         }
+        // Add separator between theta values
+        std::cout << "----------------------------------------" << std::endl;
     }
     
     // Create canvas and draw the histogram
@@ -218,6 +264,23 @@ void sweepDetector() {
     }
     
     c->Update();
+    
+    // Save flux map data to CSV
+    std::ofstream csvFile("fluxmap_data.csv");
+    csvFile << "theta,phi,fraction\n";  // Header
+    
+    for(int i = 0; i < nThetaBins; i++) {
+        double theta = (i + 0.5) * 90.0/nThetaBins;
+        for(int j = 0; j < nPhiBins; j++) {
+            double phi = (j + 0.5) * 360.0/nPhiBins;
+            double fraction = fluxMap->GetBinContent(i+1, j+1);
+            csvFile << std::fixed << std::setprecision(6)
+                   << theta << "," << phi << "," << fraction << "\n";
+        }
+    }
+    csvFile.close();
+    
+    std::cout << "\nFlux map data saved to 'fluxmap_data.csv'" << std::endl;
 }
 
 void visualizeDetector(double theta = 45.0, double phi = 0.0) {
@@ -235,51 +298,46 @@ void visualizeDetector(double theta = 45.0, double phi = 0.0) {
     // Get the world volume and configure it
     TGeoVolume* world = gGeoManager->GetTopVolume();
     world->SetLineColor(kGray);
-    world->SetTransparency(80);  // Make world box very transparent
+    world->SetTransparency(80);
     
     // Add detector to geometry
     detector.AddToGeometry(world);
     
-    // Draw the geometry with better visualization
+    // Initialize geometry first
     gGeoManager->CloseGeometry();
+    
+    // Set up the 3D viewer
+    gStyle->SetCanvasPreferGL(true);
     world->Draw("ogl");
     
-    // Trace rays
-    int n = 50;
-    double exitPortZ = -100*cm;
-    traceRays(manager, n, exitPortZ, detector);
+    // Get viewer and set initial properties
+    TGLViewer* glv = (TGLViewer*)gPad->GetViewer3D();
+    if (glv) {
+        glv->SetStyle(TGLRnrCtx::kWireFrame);
+        glv->SetDrawOption(""); 
+    }
     
-    //draw a line from the exit port to the detector
-    TGeoTube* tube = new TGeoTube("tube", 0, 0.1*cm, 100*cm);
-    TGeoVolume* line = new TGeoVolume("line", tube);
-    line->SetLineColor(kRed);
-    line->SetLineWidth(10);
-
-    // Create and draw coordinate axes
-    double axisLength = 50*cm;
-    // X axis (red)
-    TGeoTube* xTube = new TGeoTube("xTube", 0, 0.2*cm, axisLength/2);
-    TGeoVolume* xAxis = new TGeoVolume("xAxis", xTube);
-    xAxis->SetLineColor(kRed);
-    gGeoManager->GetTopVolume()->AddNode(xAxis, 1, new TGeoRotation("xrot", 0, 90, 0));
-
-    // Y axis (green)
-    TGeoTube* yTube = new TGeoTube("yTube", 0, 0.2*cm, axisLength/2);
-    TGeoVolume* yAxis = new TGeoVolume("yAxis", yTube);
-    yAxis->SetLineColor(kGreen);
-    gGeoManager->GetTopVolume()->AddNode(yAxis, 1, new TGeoRotation("yrot", -90, 0, 0));
-
-    // Z axis (blue)
-    TGeoTube* zTube = new TGeoTube("zTube", 0, 0.2*cm, axisLength/2);
-    TGeoVolume* zAxis = new TGeoVolume("zAxis", zTube);
-    zAxis->SetLineColor(kBlue);
-    gGeoManager->GetTopVolume()->AddNode(zAxis, 1);
-
+    // Draw rays after geometry is initialized
+    int n = 100;  // Increased for better visualization
+    double exitPortZ = -100*cm;
+    int hitCount = traceRays(manager, n, exitPortZ, detector, true);
+    
+    // Final viewer updates
+    if (glv) {
+        glv->DrawGuides();
+        glv->UpdateScene();
+        glv->ResetCamerasAfterNextUpdate();
+    }
+    
     c->Update();
+    c->Modified();
+    gPad->Modified();
+    gPad->Update();
     
     // Print detector information
     cout << "\nDetector Information:" << endl;
     cout << "Position (x,y,z): (" << detector.x/cm << ", " << detector.y/cm << ", " << detector.z/cm << ") cm" << endl;
     cout << "Normal vector (nx,ny,nz): (" << detector.nx << ", " << detector.ny << ", " << detector.nz << ")" << endl;
     cout << "Angular position: theta = " << theta << "°, phi = " << phi << "°" << endl;
+    cout << "Number of rays hitting the detector: " << hitCount << endl;
 }
