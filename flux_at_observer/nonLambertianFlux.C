@@ -218,7 +218,8 @@ void setupOpticsManager(AOpticsManager* manager) {
     TGeoSphere* sphere = new TGeoSphere("sphereWithExitPort", 100.1*cm, 101*cm, 0., thetaMax);
     AMirror* mirror = new AMirror("mirror", sphere);
     ABorderSurfaceCondition* condition = new ABorderSurfaceCondition(world, mirror);
-    condition->EnableLambertian(false);
+    condition->EnableLambertian(true);
+    condition->SetGaussianRoughness(0.5); // Set roughness parameter
     world->AddNode(mirror, 1);
     manager->SetNsegments(100);
     manager->CloseGeometry();
