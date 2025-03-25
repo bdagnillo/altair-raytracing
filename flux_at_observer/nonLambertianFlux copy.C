@@ -237,6 +237,7 @@ void setupOpticsManager(AOpticsManager* manager) {
     // Create and set the non-Lambertian surface condition
     NonLambertianSurface* condition = new NonLambertianSurface(world, mirror);
     condition->EnableLambertian(false);
+    condition->SetGaussianRoughness(0.5); // Set roughness parameter
     world->AddBorderSurfaceCondition(condition);
     
     // Add mirror to world

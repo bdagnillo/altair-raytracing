@@ -153,6 +153,7 @@ void setupOpticsManager(AOpticsManager* manager) {
     AMirror* mirror = new AMirror("mirror", sphere);
     ABorderSurfaceCondition* condition = new ABorderSurfaceCondition(world, mirror);
     condition->EnableLambertian(true);
+    condition->SetGaussianRoughness(0.5); // Set roughness parameter
     world->AddNode(mirror, 1);
     manager->SetNsegments(100);
     manager->CloseGeometry();
@@ -171,7 +172,7 @@ int traceRays(AOpticsManager* manager, int n, double exitPortZ, Detector& detect
     
     for (int i = 0; i < n; ++i) {
         double x = -60*cm;
-        ARay* ray = new ARay(0, 400*nm, x, 0*cm, -80*cm, 0, 5, 0, 0);
+        ARay* ray = new ARay(0, 660*nm, x, 0*cm, -80*cm, 0, 5, 0, 0);
         manager->TraceNonSequential(*ray);
         
         if (drawRays) {
@@ -289,22 +290,28 @@ void visualizeDetector(double theta = 45.0, double phi = 0.0) {
     c->cd();
     
     AOpticsManager* manager = new AOpticsManager("manager", "spherical shell");
-    setupOpticsManager(manager);
     
-    // Create and position detector first
+    // Setup basic geometry without closing it yet
+    manager->SetLimit(10000);
+    TGeoBBox* box = new TGeoBBox("box", 200*cm, 200*cm, 200*cm);
+    AOpticalComponent* world = new AOpticalComponent("world", box);
+    manager->SetTopVolume(world);
+    TGeoSphere* sphere = new TGeoSphere("sphereWithExitPort", 100.1*cm, 101*cm, 0., thetaMax);
+    AMirror* mirror = new AMirror("mirror", sphere);
+    ABorderSurfaceCondition* condition = new ABorderSurfaceCondition(world, mirror);
+    condition->EnableLambertian(true);
+    world->AddNode(mirror, 1);
+    manager->SetNsegments(100);
+    
+    // Create and position detector
     Detector detector(20*cm, 20*cm);
     detector.setPosition(theta, phi, 100*cm);
-    
-    // Get the world volume and configure it
-    TGeoVolume* world = gGeoManager->GetTopVolume();
-    world->SetLineColor(kGray);
-    world->SetTransparency(80);
     
     // Add detector to geometry
     detector.AddToGeometry(world);
     
-    // Initialize geometry first
-    gGeoManager->CloseGeometry();
+    // Now close the geometry after all components are added
+    manager->CloseGeometry();
     
     // Set up the 3D viewer
     gStyle->SetCanvasPreferGL(true);
@@ -314,30 +321,28 @@ void visualizeDetector(double theta = 45.0, double phi = 0.0) {
     TGLViewer* glv = (TGLViewer*)gPad->GetViewer3D();
     if (glv) {
         glv->SetStyle(TGLRnrCtx::kWireFrame);
-        glv->SetDrawOption(""); 
+        glv->SetDrawOption("");
     }
     
     // Draw rays after geometry is initialized
-    int n = 100;  // Increased for better visualization
+    int n = 100;
     double exitPortZ = -100*cm;
     int hitCount = traceRays(manager, n, exitPortZ, detector, true);
     
-    // Final viewer updates
+    // Final viewer updates - AVOID DrawGuides() which causes segfault
     if (glv) {
-        glv->DrawGuides();
+        // glv->DrawGuides(); - Remove this line that caused the crash
         glv->UpdateScene();
         glv->ResetCamerasAfterNextUpdate();
     }
     
     c->Update();
-    c->Modified();
-    gPad->Modified();
-    gPad->Update();
     
     // Print detector information
     cout << "\nDetector Information:" << endl;
     cout << "Position (x,y,z): (" << detector.x/cm << ", " << detector.y/cm << ", " << detector.z/cm << ") cm" << endl;
     cout << "Normal vector (nx,ny,nz): (" << detector.nx << ", " << detector.ny << ", " << detector.nz << ")" << endl;
     cout << "Angular position: theta = " << theta << "°, phi = " << phi << "°" << endl;
-    cout << "Number of rays hitting the detector: " << hitCount << endl;
+    cout << "Number of rays hitting the detector: " << hitCount << "/" << n << endl;
 }
+
