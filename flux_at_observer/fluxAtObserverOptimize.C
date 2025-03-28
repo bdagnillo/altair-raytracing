@@ -206,8 +206,10 @@ void setupOpticsManager(AOpticsManager* manager, int maxReflections = MAX_REFLEC
     mirror->SetReflectance(reflectance);
     
     ABorderSurfaceCondition* condition = new ABorderSurfaceCondition(world, mirror);
+    // condition->EnableLambertian(false);
     condition->EnableLambertian(true);
-    condition->SetGaussianRoughness(roughness);
+    // condition->SetGaussianRoughness(roughness);
+    condition->SetGaussianRoughness(0.01);
     
     world->AddNode(mirror, 1);
     
@@ -496,7 +498,7 @@ void sweepDetector(bool notify = true, const char* saveFolder = "results", int t
     double exitPortZ = -100*cm;
     
     // Configure angular binning
-    const int nThetaBins = 180;
+    const int nThetaBins = 45;
     const int nPhiBins = 90;
     
     // Create directory and set up CSV file
@@ -942,6 +944,396 @@ void sweepDetectorOptimized(bool notify = true, const char* saveFolder = "result
     delete manager;
 }
 
+// Add a new function with improved monitoring capabilities
+
+void sweepDetectorWithMonitor(bool notify = true, const char* saveFolder = "results", int threads = -1) {
+    // Initialize ROOT threading
+    TThread::Initialize();
+    
+    // Determine thread count - use fewer threads if they're causing slowdowns
+    int maxPositionThreads = (threads > 0) ? threads : 1;
+    if (maxPositionThreads > 4) maxPositionThreads = 4;  // Cap at 4 threads max
+    
+    std::cout << "Using " << maxPositionThreads << " threads for position processing" << std::endl;
+    
+    AOpticsManager* manager = new AOpticsManager("manager", "spherical shell");
+    
+    // Set up geometry BEFORE enabling threading
+    setupOpticsManager(manager, MAX_REFLECTIONS, 0.75, 0.99, false);
+    
+    // Only set max threads AFTER geometry is closed
+    if (std::thread::hardware_concurrency() > 1) {
+        int maxRayThreads = std::max(1, (int)std::thread::hardware_concurrency()/2);
+        manager->SetMaxThreads(maxRayThreads);
+        std::cout << "Using " << maxRayThreads << " threads for each ray tracing task" << std::endl;
+    }
+    
+    // Ray count and binning configuration
+    int n = 50000;
+    double exitPortZ = -100*cm;
+    const int nThetaBins = 180;
+    const int nPhiBins = 90;
+    
+    // File setup
+    std::string filename = "detector_data_" + std::to_string(n) + "rays.csv";
+    std::string fullPath = std::string(saveFolder) + "/" + filename;
+    std::string mkdirCmd = "mkdir -p \"" + std::string(saveFolder) + "\"";
+    int result = system(mkdirCmd.c_str());
+    if (result != 0) {
+        std::cerr << "Warning: Could not create directory: " << saveFolder << std::endl;
+    } else {
+        std::cout << "Using directory: " << saveFolder << std::endl;
+    }
+    
+    fullPath = getUniqueFilename(fullPath);
+    
+    // Open CSV file and write metadata
+    std::mutex csvMutex;
+    std::ofstream csvFile(fullPath);
+    if (!csvFile.is_open()) {
+        std::cerr << "Error: Could not open file " << fullPath << " for writing." << std::endl;
+        return;
+    }
+    
+    time_t now = time(nullptr);
+    struct tm* timeinfo = localtime(&now);
+    char timeBuffer[80];
+    strftime(timeBuffer, sizeof(timeBuffer), "%Y-%m-%d %H:%M:%S", timeinfo);
+    
+    csvFile << "# Detector Data - Generated: " << timeBuffer << std::endl;
+    csvFile << "# Number of rays: " << n << std::endl;
+    csvFile << "# Detector dimensions: 20cm x 20cm" << std::endl;
+    csvFile << "# Sphere inner radius: 100.1cm" << std::endl;
+    csvFile << "# Sphere outer radius: 101cm" << std::endl;
+    csvFile << "# Exit port angle: " << thetaMax << " degrees" << std::endl;
+    csvFile << "# Theta bins: " << nThetaBins << std::endl;
+    csvFile << "# Phi bins: " << nPhiBins << std::endl;
+    csvFile << "# Mirror reflectance: 0.99" << std::endl;
+    csvFile << "# Gaussian roughness: 0.75" << std::endl;
+    csvFile << "# Lambertian scattering: enabled" << std::endl;
+    csvFile << "theta,phi,fraction" << std::endl;
+    
+    // Create histogram
+    TH2D* fluxMap = new TH2D("fluxMap", "Detector Flux Map;#theta (deg);#phi (deg)", 
+                            nThetaBins, 0, 90, nPhiBins, 0, 360);
+    
+    int totalPositions = nThetaBins * nPhiBins;
+    std::cout << "\nStarting detector sweep with " << n << " rays per position "
+              << "(" << totalPositions << " positions total)..." << std::endl;
+    
+    // Set up chunking for work distribution
+    int chunksPerThread = 20;  // Each thread gets 20 chunks to process
+    int totalChunks = maxPositionThreads * chunksPerThread;
+    int positionsPerChunk = (totalPositions + totalChunks - 1) / totalChunks;
+    
+    std::cout << "Dividing work into " << totalChunks << " chunks (" 
+              << positionsPerChunk << " positions per chunk)" << std::endl;
+    
+    // Prepare worker queue with chunks
+    struct WorkChunk {
+        int startIdx;
+        int count;
+    };
+    
+    std::vector<WorkChunk> chunks;
+    int remaining = totalPositions;
+    int startIdx = 0;
+    
+    while (remaining > 0) {
+        int count = std::min(positionsPerChunk, remaining);
+        chunks.push_back({startIdx, count});
+        remaining -= count;
+        startIdx += count;
+    }
+    
+    // Shared variables and synchronization primitives
+    std::atomic<int> chunkIndex(0);
+    std::atomic<int> completedPositions(0);
+    std::atomic<bool> processingComplete(false);
+    std::mutex consoleMutex;
+    
+    // Performance tracking variables
+    struct ThreadStats {
+        int threadId;
+        int completedChunks;
+        int completedPositions;
+        double totalProcessingTime;
+        double lastChunkStartTime;
+        bool isProcessing;
+    };
+    
+    std::vector<ThreadStats> threadStats(maxPositionThreads);
+    std::mutex statsLock;
+    
+    // Initialize thread stats
+    for (int i = 0; i < maxPositionThreads; i++) {
+        threadStats[i] = {i, 0, 0, 0.0, 0.0, false};
+    }
+    
+    // Overall timer
+    TStopwatch timer;
+    timer.Start();
+    
+    // Worker function for chunk processing
+    auto processChunk = [&](int threadId) {
+        // Each thread processes chunks of positions
+        Detector detector(20*cm, 20*cm);
+        
+        while (true) {
+            // Get next chunk
+            int currentChunkIdx = chunkIndex++;
+            if (currentChunkIdx >= chunks.size()) break;
+            
+            // Record chunk start time
+            {
+                std::lock_guard<std::mutex> lock(statsLock);
+                threadStats[threadId].isProcessing = true;
+                threadStats[threadId].lastChunkStartTime = timer.RealTime();
+            }
+            
+            WorkChunk chunk = chunks[currentChunkIdx];
+            int startPos = chunk.startIdx;
+            int endPos = startPos + chunk.count - 1;
+            
+            {
+                std::lock_guard<std::mutex> lock(consoleMutex);
+                std::cout << "Thread " << threadId << " processing chunk " << currentChunkIdx
+                          << " (positions " << startPos << " to " << endPos << ")..." << std::endl;
+            }
+            
+            double chunkStartTime = timer.RealTime();
+            int positionsInChunk = 0;
+            
+            for (int pos = startPos; pos <= endPos; pos++) {
+                int i = pos / nPhiBins;
+                int j = pos % nPhiBins;
+                
+                double theta = (i + 0.5) * 90.0/nThetaBins;
+                double phi = (j + 0.5) * 360.0/nPhiBins;
+                
+                // Reset detector and position it
+                detector.hitCount = 0;
+                detector.setPosition(theta, phi, 100*cm);
+                
+                // Process rays
+                TStopwatch posTimer;
+                posTimer.Start();
+                
+                // No need for mutex - each thread has its own detector
+                traceRaysParallel(manager, n, exitPortZ, detector, false);
+                
+                posTimer.Stop();
+                double fraction = double(detector.hitCount)/double(n);
+                
+                // Update histogram and CSV (thread-safe)
+                {
+                    std::lock_guard<std::mutex> lock(csvMutex);
+                    fluxMap->SetBinContent(i+1, j+1, fraction);
+                    csvFile << std::fixed << std::setprecision(6) 
+                           << theta << "," << phi << "," << fraction << std::endl;
+                }
+                
+                // Update progress
+                int current = ++completedPositions;
+                positionsInChunk++;
+                
+                // Occasional progress update (not for every position)
+                if (current % 10 == 0 || current == totalPositions || current <= 5) {
+                    std::lock_guard<std::mutex> lock(consoleMutex);
+                    std::cout << "Thread " << threadId << " - Position (θ=" << theta << "°, φ=" << phi << "°): " 
+                             << detector.hitCount << "/" << n << " rays (" 
+                             << std::fixed << std::setprecision(2) << fraction * 100 << "%)" 
+                             << " in " << posTimer.RealTime() << "s" << std::endl;
+                }
+            }
+            
+            double chunkTime = timer.RealTime() - chunkStartTime;
+            
+            // Update thread statistics after chunk completion
+            {
+                std::lock_guard<std::mutex> lock(statsLock);
+                threadStats[threadId].completedChunks++;
+                threadStats[threadId].completedPositions += positionsInChunk;
+                threadStats[threadId].totalProcessingTime += chunkTime;
+                threadStats[threadId].isProcessing = false;
+            }
+        }
+    };
+    
+    // Monitoring thread function
+    auto monitorProgress = [&]() {
+        int lastReportedPositions = 0;
+        
+        // Wait a little before starting to monitor
+        std::this_thread::sleep_for(std::chrono::seconds(5));
+        
+        // Continue monitoring until processing is complete
+        while (!processingComplete) {
+            // Sleep between updates to avoid excessive reporting
+            std::this_thread::sleep_for(std::chrono::seconds(10));
+            
+            int current;
+            std::vector<ThreadStats> currentStats;
+            
+            // Make thread-safe copy of the stats
+            {
+                std::lock_guard<std::mutex> lock(statsLock);
+                currentStats = threadStats;
+                current = completedPositions;
+            }
+            
+            // Only report if we've made progress
+            if (current == lastReportedPositions) {
+                continue;
+            }
+            
+            lastReportedPositions = current;
+            double percentComplete = (100.0 * current) / totalPositions;
+            double elapsedTime = timer.RealTime();
+            
+            // Calculate average position processing time across active threads
+            double totalPositionsProcessed = 0;
+            double totalThreadTime = 0;
+            double activeThreadCount = 0;
+            
+            for (const auto& stats : currentStats) {
+                if (stats.completedPositions > 0) {
+                    totalPositionsProcessed += stats.completedPositions;
+                    totalThreadTime += stats.totalProcessingTime;
+                    activeThreadCount++;
+                }
+            }
+            
+            double avgTimePerPosition = totalPositionsProcessed > 0 ? 
+                totalThreadTime / totalPositionsProcessed : 0;
+            
+            // Calculate completion estimate based on actual thread performance
+            double effectiveThreads = std::min(maxPositionThreads, (int)activeThreadCount);
+            
+            // If we don't have enough data yet, use a conservative estimate
+            if (effectiveThreads < 1 || avgTimePerPosition == 0) {
+                effectiveThreads = 1;
+                avgTimePerPosition = elapsedTime / (current > 0 ? current : 1);
+            }
+            
+            // Calculate estimated remaining time
+            double remainingPositions = totalPositions - current;
+            double positionsPerThread = remainingPositions / effectiveThreads;
+            double rawRemainingTime = positionsPerThread * avgTimePerPosition;
+            
+            // Apply safety factor based on progress
+            double remainingTime;
+            if (percentComplete < 5.0) {
+                remainingTime = rawRemainingTime * 1.5; // Very early - be very conservative
+            } else if (percentComplete < 20.0) {
+                remainingTime = rawRemainingTime * 1.2; // Early - be somewhat conservative
+            } else {
+                remainingTime = rawRemainingTime;       // Later - use the raw estimate
+            }
+            
+            // Format for display
+            int hours = static_cast<int>(remainingTime / 3600);
+            int minutes = static_cast<int>((remainingTime - hours * 3600) / 60);
+            int seconds = static_cast<int>(remainingTime - hours * 3600 - minutes * 60);
+            
+            int elapsed_hours = static_cast<int>(elapsedTime / 3600);
+            int elapsed_minutes = static_cast<int>((elapsedTime - elapsed_hours * 3600) / 60);
+            int elapsed_seconds = static_cast<int>(elapsedTime - elapsed_hours * 3600 - elapsed_minutes * 60);
+            
+            // Display detailed progress report
+            std::lock_guard<std::mutex> lock(consoleMutex);
+            std::cout << "\n=== MONITOR: PROGRESS UPDATE ===" << std::endl;
+            std::cout << "Progress: " << std::fixed << std::setprecision(1) 
+                      << percentComplete << "% (" << current << "/" << totalPositions 
+                      << " positions)" << std::endl;
+            
+            std::cout << "Elapsed time: ";
+            if (elapsed_hours > 0) std::cout << elapsed_hours << "h ";
+            if (elapsed_hours > 0 || elapsed_minutes > 0) std::cout << elapsed_minutes << "m ";
+            std::cout << elapsed_seconds << "s" << std::endl;
+            
+            std::cout << "Average position time: " << avgTimePerPosition << "s" << std::endl;
+            std::cout << "Effective threads: " << effectiveThreads << std::endl;
+            
+            std::cout << "Remaining time: ";
+            if (hours > 0) std::cout << hours << "h ";
+            if (hours > 0 || minutes > 0) std::cout << minutes << "m ";
+            std::cout << seconds << "s" << std::endl;
+            
+            time_t finishTime = time(nullptr) + static_cast<time_t>(remainingTime);
+            struct tm* finishTm = localtime(&finishTime);
+            strftime(timeBuffer, sizeof(timeBuffer), "%H:%M:%S (%Y-%m-%d)", finishTm);
+            std::cout << "Estimated completion at: " << timeBuffer << std::endl;
+            
+            // Show per-thread statistics
+            std::cout << "\nPer-thread statistics:" << std::endl;
+            for (const auto& stats : currentStats) {
+                std::cout << "Thread " << stats.threadId 
+                          << ": " << stats.completedPositions << " positions in " 
+                          << stats.totalProcessingTime << "s";
+                if (stats.completedPositions > 0) {
+                    std::cout << " (avg: " << stats.totalProcessingTime / stats.completedPositions 
+                              << "s/position)";
+                }
+                std::cout << std::endl;
+            }
+            std::cout << "==========================\n" << std::endl;
+        }
+    };
+    
+    // Start worker threads
+    std::vector<std::thread> workers;
+    for (int t = 0; t < maxPositionThreads; t++) {
+        workers.emplace_back(processChunk, t);
+    }
+    
+    // Start monitoring thread
+    std::thread monitorThread(monitorProgress);
+    
+    // Wait for all worker threads to finish
+    for (auto& thread : workers) {
+        thread.join();
+    }
+    
+    // Signal that processing is complete and wait for monitor thread
+    processingComplete = true;
+    monitorThread.join();
+    
+    // After sweep completes
+    timer.Stop();
+    double realTime = timer.RealTime();
+    
+    csvFile << "# Total execution time: " << realTime << " seconds" << std::endl;
+    csvFile.close();
+    
+    std::cout << "Data saved to " << fullPath << std::endl;
+    std::cout << "Sweep completed in " << realTime << " seconds (wall clock)" << std::endl;
+    
+    // Create canvas and draw
+    TCanvas* c = new TCanvas("c", "Detector Flux Map", 1000, 800);
+    gStyle->SetOptStat(0);
+    gStyle->SetPalette(kRainBow);
+    
+    fluxMap->GetZaxis()->SetTitle("Fraction of rays detected");
+    fluxMap->Draw("COLZ");
+    
+    // Add color scale
+    gPad->Update();
+    TPaletteAxis* palette = (TPaletteAxis*)fluxMap->GetListOfFunctions()->FindObject("palette");
+    if(palette) {
+        palette->SetX1NDC(0.9);
+        palette->SetX2NDC(0.92);
+    }
+
+    if (notify) {
+        // Play a sound when sweep is complete
+        std::cout << "\n***** SWEEP COMPLETE *****\n" << std::endl;
+        std::cout << '\a' << std::endl;
+    }
+    
+    delete manager;
+}
+
 
 void visualizeDetector(double theta = 45.0, double phi = 0.0) {
     // Create canvas with square proportions
@@ -960,8 +1352,8 @@ void visualizeDetector(double theta = 45.0, double phi = 0.0) {
     
     // Add the border surface condition for mirror reflectivity
     ABorderSurfaceCondition* condition = new ABorderSurfaceCondition(world, mirror);
-    condition->EnableLambertian(true);
-    condition->SetGaussianRoughness(0.5);  
+    condition->EnableLambertian(false);
+    // condition->SetGaussianRoughness(0.00000001);  
     
     world->AddNode(mirror, 1);
     
