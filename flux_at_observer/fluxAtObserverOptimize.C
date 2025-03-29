@@ -63,15 +63,25 @@ struct Detector {
         y = radius * sin(theta_rad) * sin(phi_rad);
         z = -100*cm - radius * cos(theta_rad);  // Offset by exit port position
         
-        // FIX: Calculate normal vector that actually points TO the exit port
-        double dx = 0 - x;            // Vector FROM detector TO exit port
-        double dy = 0 - y;
-        double dz = -100*cm - z;
-        double mag = sqrt(dx*dx + dy*dy + dz*dz);
+        // Calculate normal vector pointing directly at the exit port center (0,0,-100*cm)
+        double exit_port_x = 0;
+        double exit_port_y = 0; 
+        double exit_port_z = -100*cm;
         
-        nx = dx/mag;  // Normal now correctly points toward exit port
+        // Vector FROM detector TO exit port center
+        double dx = exit_port_x - x;
+        double dy = exit_port_y - y;
+        double dz = exit_port_z - z;
+        
+        // Normalize to get unit normal vector
+        double mag = sqrt(dx*dx + dy*dy + dz*dz);
+        nx = dx/mag;
         ny = dy/mag;
         nz = dz/mag;
+        
+        // Debug info
+        // std::cout << "Detector position: (" << x/cm << ", " << y/cm << ", " << z/cm << ") cm" << std::endl;
+        // std::cout << "Normal vector: (" << nx << ", " << ny << ", " << nz << ")" << std::endl;
     }
     
     bool checkIntersection(const ARay* ray) {
@@ -335,6 +345,81 @@ int traceRaysParallel(AOpticsManager* manager, int n, double exitPortZ, Detector
     return hitCount;
 }
 
+// Parallelized version of traceRays with parameterized source position and proper ray direction
+int traceRaysParallel(AOpticsManager* manager, int n, double exitPortZ, Detector& detector, 
+                      double srcTheta = 140.0, double srcPhi = 0.0, double srcRadius = 100.0,
+                      bool drawRays = false) {
+    int hitCount = 0;
+    
+    // Calculate ray source position in Cartesian coordinates
+    double srcTheta_rad = srcTheta * M_PI / 180.0;
+    double srcPhi_rad = srcPhi * M_PI / 180.0;
+    double srcX = srcRadius * cm * sin(srcTheta_rad) * cos(srcPhi_rad);
+    double srcY = srcRadius * cm * sin(srcTheta_rad) * sin(srcPhi_rad);
+    double srcZ = srcRadius * cm * cos(srcTheta_rad);
+    
+    // Calculate direction vector pointing toward sphere center (0,0,0)
+    double dirX = -srcX;
+    double dirY = -srcY; 
+    double dirZ = -srcZ;
+    
+    // Normalize the direction vector
+    double mag = sqrt(dirX*dirX + dirY*dirY + dirZ*dirZ);
+    dirX /= mag;
+    dirY /= mag;
+    dirZ /= mag;
+    
+    // Create an ARayArray for batch processing
+    ARayArray* rayArray = new ARayArray();
+    
+    // Fill the array with rays from the parameterized source position
+    for (int i = 0; i < n; ++i) {
+        // Use the normalized direction vector to point toward sphere center
+        ARay* ray = new ARay(i, 660*nm, srcX, srcY, srcZ, dirX, dirY, dirZ, 0);
+        rayArray->Add(ray);
+    }
+    
+    // Let ROBAST handle multi-threading internally
+    manager->TraceNonSequential(rayArray);
+    
+    // Process results - this doesn't need to be parallel since tracing is done
+    TObjArray* stopped = rayArray->GetStopped();
+    TObjArray* exited = rayArray->GetExited();
+    
+    // Count hits from stopped rays
+    for (int i = 0; i <= stopped->GetLast(); i++) {
+        ARay* ray = (ARay*)stopped->At(i);
+        if (!ray) continue;
+        
+        Double_t lastPoint[3];
+        ray->GetLastPoint(lastPoint);
+        
+        if (lastPoint[2] < exitPortZ && detector.checkIntersection(ray)) {
+            hitCount++;
+            detector.hitCount++;
+        }
+    }
+    
+    // Count hits from exited rays
+    for (int i = 0; i <= exited->GetLast(); i++) {
+        ARay* ray = (ARay*)exited->At(i);
+        if (!ray) continue;
+        
+        Double_t lastPoint[3];
+        ray->GetLastPoint(lastPoint);
+        
+        if (lastPoint[2] < exitPortZ && detector.checkIntersection(ray)) {
+            hitCount++;
+            detector.hitCount++;
+        }
+    }
+    
+    // Clean up
+    delete rayArray;
+    
+    return hitCount;
+}
+
 int traceRaysWithStats(AOpticsManager* manager, int n, double exitPortZ, Detector& detector) {
     int hitCount = 0;
     int exitCount = 0;
@@ -472,7 +557,13 @@ public:
     }
 };
 
-// Updated sweepDetector function with parallel position processing
+// Move this struct outside the function to fix linkage issues
+// Add this after the ThreadSafeQueue class definition and before sweepDetectorOptimized
+struct WorkChunk {
+    int startIdx;
+    int count;
+};
+
 void sweepDetector(bool notify = true, const char* saveFolder = "results", int threads = -1) {
     // Initialize ROOT
     TThread::Initialize();
@@ -574,7 +665,7 @@ void sweepDetector(bool notify = true, const char* saveFolder = "results", int t
             TStopwatch posTimer;
             posTimer.Start();
             
-            traceRaysParallel(manager, n, exitPortZ, detector, false);
+            traceRaysParallel(manager, n, exitPortZ, detector, 130.0, 45.0, 95.0);
             
             posTimer.Stop();
             double fraction = double(detector.hitCount)/double(n);
@@ -772,11 +863,6 @@ void sweepDetectorOptimized(bool notify = true, const char* saveFolder = "result
               << positionsPerChunk << " positions per chunk)" << std::endl;
     
     // Prepare worker queue with chunks instead of individual positions
-    struct WorkChunk {
-        int startIdx;
-        int count;
-    };
-    
     std::vector<WorkChunk> chunks;
     int remaining = totalPositions;
     int startIdx = 0;
@@ -944,398 +1030,9 @@ void sweepDetectorOptimized(bool notify = true, const char* saveFolder = "result
     delete manager;
 }
 
-// Add a new function with improved monitoring capabilities
-
-void sweepDetectorWithMonitor(bool notify = true, const char* saveFolder = "results", int threads = -1) {
-    // Initialize ROOT threading
-    TThread::Initialize();
-    
-    // Determine thread count - use fewer threads if they're causing slowdowns
-    int maxPositionThreads = (threads > 0) ? threads : 1;
-    if (maxPositionThreads > 4) maxPositionThreads = 4;  // Cap at 4 threads max
-    
-    std::cout << "Using " << maxPositionThreads << " threads for position processing" << std::endl;
-    
-    AOpticsManager* manager = new AOpticsManager("manager", "spherical shell");
-    
-    // Set up geometry BEFORE enabling threading
-    setupOpticsManager(manager, MAX_REFLECTIONS, 0.75, 0.99, false);
-    
-    // Only set max threads AFTER geometry is closed
-    if (std::thread::hardware_concurrency() > 1) {
-        int maxRayThreads = std::max(1, (int)std::thread::hardware_concurrency()/2);
-        manager->SetMaxThreads(maxRayThreads);
-        std::cout << "Using " << maxRayThreads << " threads for each ray tracing task" << std::endl;
-    }
-    
-    // Ray count and binning configuration
-    int n = 50000;
-    double exitPortZ = -100*cm;
-    const int nThetaBins = 180;
-    const int nPhiBins = 90;
-    
-    // File setup
-    std::string filename = "detector_data_" + std::to_string(n) + "rays.csv";
-    std::string fullPath = std::string(saveFolder) + "/" + filename;
-    std::string mkdirCmd = "mkdir -p \"" + std::string(saveFolder) + "\"";
-    int result = system(mkdirCmd.c_str());
-    if (result != 0) {
-        std::cerr << "Warning: Could not create directory: " << saveFolder << std::endl;
-    } else {
-        std::cout << "Using directory: " << saveFolder << std::endl;
-    }
-    
-    fullPath = getUniqueFilename(fullPath);
-    
-    // Open CSV file and write metadata
-    std::mutex csvMutex;
-    std::ofstream csvFile(fullPath);
-    if (!csvFile.is_open()) {
-        std::cerr << "Error: Could not open file " << fullPath << " for writing." << std::endl;
-        return;
-    }
-    
-    time_t now = time(nullptr);
-    struct tm* timeinfo = localtime(&now);
-    char timeBuffer[80];
-    strftime(timeBuffer, sizeof(timeBuffer), "%Y-%m-%d %H:%M:%S", timeinfo);
-    
-    csvFile << "# Detector Data - Generated: " << timeBuffer << std::endl;
-    csvFile << "# Number of rays: " << n << std::endl;
-    csvFile << "# Detector dimensions: 20cm x 20cm" << std::endl;
-    csvFile << "# Sphere inner radius: 100.1cm" << std::endl;
-    csvFile << "# Sphere outer radius: 101cm" << std::endl;
-    csvFile << "# Exit port angle: " << thetaMax << " degrees" << std::endl;
-    csvFile << "# Theta bins: " << nThetaBins << std::endl;
-    csvFile << "# Phi bins: " << nPhiBins << std::endl;
-    csvFile << "# Mirror reflectance: 0.99" << std::endl;
-    csvFile << "# Gaussian roughness: 0.75" << std::endl;
-    csvFile << "# Lambertian scattering: enabled" << std::endl;
-    csvFile << "theta,phi,fraction" << std::endl;
-    
-    // Create histogram
-    TH2D* fluxMap = new TH2D("fluxMap", "Detector Flux Map;#theta (deg);#phi (deg)", 
-                            nThetaBins, 0, 90, nPhiBins, 0, 360);
-    
-    int totalPositions = nThetaBins * nPhiBins;
-    std::cout << "\nStarting detector sweep with " << n << " rays per position "
-              << "(" << totalPositions << " positions total)..." << std::endl;
-    
-    // Set up chunking for work distribution
-    int chunksPerThread = 20;  // Each thread gets 20 chunks to process
-    int totalChunks = maxPositionThreads * chunksPerThread;
-    int positionsPerChunk = (totalPositions + totalChunks - 1) / totalChunks;
-    
-    std::cout << "Dividing work into " << totalChunks << " chunks (" 
-              << positionsPerChunk << " positions per chunk)" << std::endl;
-    
-    // Prepare worker queue with chunks
-    struct WorkChunk {
-        int startIdx;
-        int count;
-    };
-    
-    std::vector<WorkChunk> chunks;
-    int remaining = totalPositions;
-    int startIdx = 0;
-    
-    while (remaining > 0) {
-        int count = std::min(positionsPerChunk, remaining);
-        chunks.push_back({startIdx, count});
-        remaining -= count;
-        startIdx += count;
-    }
-    
-    // Shared variables and synchronization primitives
-    std::atomic<int> chunkIndex(0);
-    std::atomic<int> completedPositions(0);
-    std::atomic<bool> processingComplete(false);
-    std::mutex consoleMutex;
-    
-    // Performance tracking variables
-    struct ThreadStats {
-        int threadId;
-        int completedChunks;
-        int completedPositions;
-        double totalProcessingTime;
-        double lastChunkStartTime;
-        bool isProcessing;
-    };
-    
-    std::vector<ThreadStats> threadStats(maxPositionThreads);
-    std::mutex statsLock;
-    
-    // Initialize thread stats
-    for (int i = 0; i < maxPositionThreads; i++) {
-        threadStats[i] = {i, 0, 0, 0.0, 0.0, false};
-    }
-    
-    // Overall timer
-    TStopwatch timer;
-    timer.Start();
-    
-    // Worker function for chunk processing
-    auto processChunk = [&](int threadId) {
-        // Each thread processes chunks of positions
-        Detector detector(20*cm, 20*cm);
-        
-        while (true) {
-            // Get next chunk
-            int currentChunkIdx = chunkIndex++;
-            if (currentChunkIdx >= chunks.size()) break;
-            
-            // Record chunk start time
-            {
-                std::lock_guard<std::mutex> lock(statsLock);
-                threadStats[threadId].isProcessing = true;
-                threadStats[threadId].lastChunkStartTime = timer.RealTime();
-            }
-            
-            WorkChunk chunk = chunks[currentChunkIdx];
-            int startPos = chunk.startIdx;
-            int endPos = startPos + chunk.count - 1;
-            
-            {
-                std::lock_guard<std::mutex> lock(consoleMutex);
-                std::cout << "Thread " << threadId << " processing chunk " << currentChunkIdx
-                          << " (positions " << startPos << " to " << endPos << ")..." << std::endl;
-            }
-            
-            double chunkStartTime = timer.RealTime();
-            int positionsInChunk = 0;
-            
-            for (int pos = startPos; pos <= endPos; pos++) {
-                int i = pos / nPhiBins;
-                int j = pos % nPhiBins;
-                
-                double theta = (i + 0.5) * 90.0/nThetaBins;
-                double phi = (j + 0.5) * 360.0/nPhiBins;
-                
-                // Reset detector and position it
-                detector.hitCount = 0;
-                detector.setPosition(theta, phi, 100*cm);
-                
-                // Process rays
-                TStopwatch posTimer;
-                posTimer.Start();
-                
-                // No need for mutex - each thread has its own detector
-                traceRaysParallel(manager, n, exitPortZ, detector, false);
-                
-                posTimer.Stop();
-                double fraction = double(detector.hitCount)/double(n);
-                
-                // Update histogram and CSV (thread-safe)
-                {
-                    std::lock_guard<std::mutex> lock(csvMutex);
-                    fluxMap->SetBinContent(i+1, j+1, fraction);
-                    csvFile << std::fixed << std::setprecision(6) 
-                           << theta << "," << phi << "," << fraction << std::endl;
-                }
-                
-                // Update progress
-                int current = ++completedPositions;
-                positionsInChunk++;
-                
-                // Occasional progress update (not for every position)
-                if (current % 10 == 0 || current == totalPositions || current <= 5) {
-                    std::lock_guard<std::mutex> lock(consoleMutex);
-                    std::cout << "Thread " << threadId << " - Position (θ=" << theta << "°, φ=" << phi << "°): " 
-                             << detector.hitCount << "/" << n << " rays (" 
-                             << std::fixed << std::setprecision(2) << fraction * 100 << "%)" 
-                             << " in " << posTimer.RealTime() << "s" << std::endl;
-                }
-            }
-            
-            double chunkTime = timer.RealTime() - chunkStartTime;
-            
-            // Update thread statistics after chunk completion
-            {
-                std::lock_guard<std::mutex> lock(statsLock);
-                threadStats[threadId].completedChunks++;
-                threadStats[threadId].completedPositions += positionsInChunk;
-                threadStats[threadId].totalProcessingTime += chunkTime;
-                threadStats[threadId].isProcessing = false;
-            }
-        }
-    };
-    
-    // Monitoring thread function
-    auto monitorProgress = [&]() {
-        int lastReportedPositions = 0;
-        
-        // Wait a little before starting to monitor
-        std::this_thread::sleep_for(std::chrono::seconds(5));
-        
-        // Continue monitoring until processing is complete
-        while (!processingComplete) {
-            // Sleep between updates to avoid excessive reporting
-            std::this_thread::sleep_for(std::chrono::seconds(10));
-            
-            int current;
-            std::vector<ThreadStats> currentStats;
-            
-            // Make thread-safe copy of the stats
-            {
-                std::lock_guard<std::mutex> lock(statsLock);
-                currentStats = threadStats;
-                current = completedPositions;
-            }
-            
-            // Only report if we've made progress
-            if (current == lastReportedPositions) {
-                continue;
-            }
-            
-            lastReportedPositions = current;
-            double percentComplete = (100.0 * current) / totalPositions;
-            double elapsedTime = timer.RealTime();
-            
-            // Calculate average position processing time across active threads
-            double totalPositionsProcessed = 0;
-            double totalThreadTime = 0;
-            double activeThreadCount = 0;
-            
-            for (const auto& stats : currentStats) {
-                if (stats.completedPositions > 0) {
-                    totalPositionsProcessed += stats.completedPositions;
-                    totalThreadTime += stats.totalProcessingTime;
-                    activeThreadCount++;
-                }
-            }
-            
-            double avgTimePerPosition = totalPositionsProcessed > 0 ? 
-                totalThreadTime / totalPositionsProcessed : 0;
-            
-            // Calculate completion estimate based on actual thread performance
-            double effectiveThreads = std::min(maxPositionThreads, (int)activeThreadCount);
-            
-            // If we don't have enough data yet, use a conservative estimate
-            if (effectiveThreads < 1 || avgTimePerPosition == 0) {
-                effectiveThreads = 1;
-                avgTimePerPosition = elapsedTime / (current > 0 ? current : 1);
-            }
-            
-            // Calculate estimated remaining time
-            double remainingPositions = totalPositions - current;
-            double positionsPerThread = remainingPositions / effectiveThreads;
-            double rawRemainingTime = positionsPerThread * avgTimePerPosition;
-            
-            // Apply safety factor based on progress
-            double remainingTime;
-            if (percentComplete < 5.0) {
-                remainingTime = rawRemainingTime * 1.5; // Very early - be very conservative
-            } else if (percentComplete < 20.0) {
-                remainingTime = rawRemainingTime * 1.2; // Early - be somewhat conservative
-            } else {
-                remainingTime = rawRemainingTime;       // Later - use the raw estimate
-            }
-            
-            // Format for display
-            int hours = static_cast<int>(remainingTime / 3600);
-            int minutes = static_cast<int>((remainingTime - hours * 3600) / 60);
-            int seconds = static_cast<int>(remainingTime - hours * 3600 - minutes * 60);
-            
-            int elapsed_hours = static_cast<int>(elapsedTime / 3600);
-            int elapsed_minutes = static_cast<int>((elapsedTime - elapsed_hours * 3600) / 60);
-            int elapsed_seconds = static_cast<int>(elapsedTime - elapsed_hours * 3600 - elapsed_minutes * 60);
-            
-            // Display detailed progress report
-            std::lock_guard<std::mutex> lock(consoleMutex);
-            std::cout << "\n=== MONITOR: PROGRESS UPDATE ===" << std::endl;
-            std::cout << "Progress: " << std::fixed << std::setprecision(1) 
-                      << percentComplete << "% (" << current << "/" << totalPositions 
-                      << " positions)" << std::endl;
-            
-            std::cout << "Elapsed time: ";
-            if (elapsed_hours > 0) std::cout << elapsed_hours << "h ";
-            if (elapsed_hours > 0 || elapsed_minutes > 0) std::cout << elapsed_minutes << "m ";
-            std::cout << elapsed_seconds << "s" << std::endl;
-            
-            std::cout << "Average position time: " << avgTimePerPosition << "s" << std::endl;
-            std::cout << "Effective threads: " << effectiveThreads << std::endl;
-            
-            std::cout << "Remaining time: ";
-            if (hours > 0) std::cout << hours << "h ";
-            if (hours > 0 || minutes > 0) std::cout << minutes << "m ";
-            std::cout << seconds << "s" << std::endl;
-            
-            time_t finishTime = time(nullptr) + static_cast<time_t>(remainingTime);
-            struct tm* finishTm = localtime(&finishTime);
-            strftime(timeBuffer, sizeof(timeBuffer), "%H:%M:%S (%Y-%m-%d)", finishTm);
-            std::cout << "Estimated completion at: " << timeBuffer << std::endl;
-            
-            // Show per-thread statistics
-            std::cout << "\nPer-thread statistics:" << std::endl;
-            for (const auto& stats : currentStats) {
-                std::cout << "Thread " << stats.threadId 
-                          << ": " << stats.completedPositions << " positions in " 
-                          << stats.totalProcessingTime << "s";
-                if (stats.completedPositions > 0) {
-                    std::cout << " (avg: " << stats.totalProcessingTime / stats.completedPositions 
-                              << "s/position)";
-                }
-                std::cout << std::endl;
-            }
-            std::cout << "==========================\n" << std::endl;
-        }
-    };
-    
-    // Start worker threads
-    std::vector<std::thread> workers;
-    for (int t = 0; t < maxPositionThreads; t++) {
-        workers.emplace_back(processChunk, t);
-    }
-    
-    // Start monitoring thread
-    std::thread monitorThread(monitorProgress);
-    
-    // Wait for all worker threads to finish
-    for (auto& thread : workers) {
-        thread.join();
-    }
-    
-    // Signal that processing is complete and wait for monitor thread
-    processingComplete = true;
-    monitorThread.join();
-    
-    // After sweep completes
-    timer.Stop();
-    double realTime = timer.RealTime();
-    
-    csvFile << "# Total execution time: " << realTime << " seconds" << std::endl;
-    csvFile.close();
-    
-    std::cout << "Data saved to " << fullPath << std::endl;
-    std::cout << "Sweep completed in " << realTime << " seconds (wall clock)" << std::endl;
-    
-    // Create canvas and draw
-    TCanvas* c = new TCanvas("c", "Detector Flux Map", 1000, 800);
-    gStyle->SetOptStat(0);
-    gStyle->SetPalette(kRainBow);
-    
-    fluxMap->GetZaxis()->SetTitle("Fraction of rays detected");
-    fluxMap->Draw("COLZ");
-    
-    // Add color scale
-    gPad->Update();
-    TPaletteAxis* palette = (TPaletteAxis*)fluxMap->GetListOfFunctions()->FindObject("palette");
-    if(palette) {
-        palette->SetX1NDC(0.9);
-        palette->SetX2NDC(0.92);
-    }
-
-    if (notify) {
-        // Play a sound when sweep is complete
-        std::cout << "\n***** SWEEP COMPLETE *****\n" << std::endl;
-        std::cout << '\a' << std::endl;
-    }
-    
-    delete manager;
-}
-
-
-void visualizeDetector(double theta = 45.0, double phi = 0.0) {
+void visualizeDetector(double detTheta = 45.0, double detPhi = 0.0, 
+                       double srcTheta = 140.0, double srcPhi = 0.0, 
+                       double srcRadius = 100.0) {
     // Create canvas with square proportions
     TCanvas* c = new TCanvas("cvis", "Detector Visualization", 800, 800);
     c->cd();
@@ -1352,15 +1049,43 @@ void visualizeDetector(double theta = 45.0, double phi = 0.0) {
     
     // Add the border surface condition for mirror reflectivity
     ABorderSurfaceCondition* condition = new ABorderSurfaceCondition(world, mirror);
-    condition->EnableLambertian(false);
-    // condition->SetGaussianRoughness(0.00000001);  
+    condition->EnableLambertian(true);
+    condition->SetGaussianRoughness(0.75);  // Reduce roughness for stability
     
     world->AddNode(mirror, 1);
     
     // Add detector to geometry
     Detector detector(20*cm, 20*cm);
-    detector.setPosition(theta, phi, 100*cm);
+    detector.setPosition(detTheta, detPhi, 100*cm);
     detector.AddToGeometry(world);
+    
+    // Calculate ray source position in Cartesian coordinates
+    double srcTheta_rad = srcTheta * M_PI / 180.0;
+    double srcPhi_rad = srcPhi * M_PI / 180.0;
+    double srcX = srcRadius * cm * sin(srcTheta_rad) * cos(srcPhi_rad);
+    double srcY = srcRadius * cm * sin(srcTheta_rad) * sin(srcPhi_rad);
+    double srcZ = srcRadius * cm * cos(srcTheta_rad);
+    
+    // *** IMPORTANT: Make sure source is not too close to the mirror surface ***
+    // Place source clearly inside the sphere (or clearly outside) to avoid numerical issues
+    double distFromCenter = sqrt(srcX*srcX + srcY*srcY + srcZ*srcZ);
+    if (abs(distFromCenter - 100.1*cm) < 0.5*cm) {
+        std::cout << "WARNING: Source is too close to mirror surface. Adjusting position." << std::endl;
+        // Adjust radius to be safely inside
+        double safeRadius = 95.0*cm;
+        double scale = safeRadius / distFromCenter;
+        srcX *= scale;
+        srcY *= scale;
+        srcZ *= scale;
+        std::cout << "Adjusted position: (" << srcX/cm << ", " << srcY/cm << ", " << srcZ/cm << ") cm" << std::endl;
+    }
+    
+    // Create a marker for the ray source
+    TGeoSphere* sourceSphere = new TGeoSphere("sourceSphere", 0, 3*cm);
+    TGeoVolume* sourceVol = new TGeoVolume("source", sourceSphere);
+    sourceVol->SetLineColor(kRed);
+    sourceVol->SetFillColor(kRed);
+    world->AddNode(sourceVol, 1, new TGeoTranslation(srcX, srcY, srcZ));
     
     // Configure and close geometry
     manager->SetNsegments(60);
@@ -1381,13 +1106,17 @@ void visualizeDetector(double theta = 45.0, double phi = 0.0) {
     // Let the viewer initialize completely before ray tracing
     gSystem->ProcessEvents();
     
+    // Print source position information
+    std::cout << "\nRay Source Information:" << std::endl;
+    std::cout << "Angular position: theta = " << srcTheta << "°, phi = " << srcPhi << "°" << std::endl;
+    std::cout << "Position (x,y,z): (" << srcX/cm << ", " << srcY/cm << ", " << srcZ/cm << ") cm" << std::endl;
+    
     // Now trace rays with statistics
-    int n = 1000;
+    int n = 200;  // Reduce ray count for debugging
     double exitPortZ = -100*cm;
     
     // First run traceRaysWithStats to get statistics
     std::cout << "\nTracing " << n << " rays with detailed statistics:" << std::endl;
-    int hitCount = traceRaysWithStats(manager, n, exitPortZ, detector);
     
     // Reset counters for visualization
     detector.hitCount = 0;
@@ -1395,52 +1124,71 @@ void visualizeDetector(double theta = 45.0, double phi = 0.0) {
     int suspendedCount = 0;
     int absorbedCount = 0;
     
-    // Use individual rays for better stability
-    for (int i = 0; i < n; ++i) {
-        // Match parameters with working code
-        // Ray parameters
-        double x = -60*cm;
-        ARay* ray = new ARay(i, 660*nm, x, 0*cm, -80*cm, 0, 5, 0, 0);
-        
-        manager->TraceNonSequential(*ray);
-        
-        TPolyLine3D* pol = ray->MakePolyLine3D();
-        
-        Double_t lastPoint[3];
-        ray->GetLastPoint(lastPoint);
-        
-        if (ray->IsSuspended()) {
-            pol->SetLineColor(kMagenta);  // Suspended rays in magenta
-            suspendedCount++;
-        } else if (ray->IsAbsorbed()) {
-            pol->SetLineColor(kBlack);    // Absorbed rays in black
-            absorbedCount++;
-        } else if (lastPoint[2] < exitPortZ) {
-            exitCount++;
-            if (detector.checkIntersection(ray)) {
-                pol->SetLineColor(kGreen);
-                detector.hitCount++;
-            } else {
-                pol->SetLineColor(kYellow);
+    // Use a try-catch to prevent program crash
+    try {
+        // Use individual rays for better stability
+        for (int i = 0; i < n; ++i) {
+            // Calculate direction vector pointing toward sphere center
+            double dirX = -srcX;
+            double dirY = -srcY; 
+            double dirZ = -srcZ;
+            
+            // Normalize the direction vector
+            double mag = sqrt(dirX*dirX + dirY*dirY + dirZ*dirZ);
+            dirX /= mag;
+            dirY /= mag;
+            dirZ /= mag;
+            
+            // Use parameterized source position with proper direction
+            ARay* ray = new ARay(i, 660*nm, srcX, srcY, srcZ, dirX, dirY, dirZ, 0);
+            
+            // Add error checking
+            try {
+                manager->TraceNonSequential(*ray);
+                
+                TPolyLine3D* pol = ray->MakePolyLine3D();
+                
+                Double_t lastPoint[3];
+                ray->GetLastPoint(lastPoint);
+                
+                if (ray->IsSuspended()) {
+                    pol->SetLineColor(kMagenta);
+                    suspendedCount++;
+                } else if (ray->IsAbsorbed()) {
+                    pol->SetLineColor(kBlack);
+                    absorbedCount++;
+                } else if (lastPoint[2] < exitPortZ) {
+                    exitCount++;
+                    if (detector.checkIntersection(ray)) {
+                        pol->SetLineColor(kGreen);
+                        detector.hitCount++;
+                    } else {
+                        pol->SetLineColor(kYellow);
+                    }
+                } else {
+                    pol->SetLineColor(kRed);
+                }
+                
+                pol->SetLineWidth(2);
+                pol->Draw();
+            } catch (std::exception& e) {
+                std::cerr << "Error tracing ray " << i << ": " << e.what() << std::endl;
+            } catch (...) {
+                std::cerr << "Unknown error tracing ray " << i << std::endl;
             }
-        } else {
-            pol->SetLineColor(kRed);    // Didn't exit
+            
+            delete ray;
+            
+            // Update periodically
+            if (i % 10 == 0) {
+                c->Update();
+                gSystem->ProcessEvents();
+            }
         }
-        
-        pol->SetLineWidth(2);
-        pol->Draw();
-        
-        // Add debugging to see actual internal calculations
-        // std::cout << "Detector at: (" << detector.x/cm << ", " << detector.y/cm << ", " << detector.z/cm << ") cm" << std::endl;
-        // std::cout << "Ray exit at: (" << lastPoint[0]/cm << ", " << lastPoint[1]/cm << ", " << lastPoint[2]/cm << ") cm" << std::endl;
-
-        delete ray;
-        
-        // Update periodically
-        if (i % 10 == 0) {
-            c->Update();
-            gSystem->ProcessEvents();
-        }
+    } catch (std::exception& e) {
+        std::cerr << "Error during ray tracing: " << e.what() << std::endl;
+    } catch (...) {
+        std::cerr << "Unknown error during ray tracing" << std::endl;
     }
     
     c->Update();
@@ -1453,7 +1201,7 @@ void visualizeDetector(double theta = 45.0, double phi = 0.0) {
     std::cout << "Rays suspended: " << suspendedCount << std::endl;
     std::cout << "Rays absorbed: " << absorbedCount << std::endl;
     std::cout << "Rays reflected back: " << (n - exitCount - suspendedCount - absorbedCount) << std::endl;
-    std::cout << "Angular position: theta = " << theta << "°, phi = " << phi << "°" << std::endl;
+    std::cout << "Angular position: theta = " << detTheta << "°, phi = " << detPhi << "°" << std::endl;
     std::cout << "Position (x,y,z): (" << detector.x/cm << ", " << detector.y/cm << ", " << detector.z/cm << ") cm" << std::endl;
     
     // Legend for ray colors
@@ -1468,4 +1216,18 @@ void visualizeDetector(double theta = 45.0, double phi = 0.0) {
     legend->Draw();
     
     c->Update();
+}
+
+void sweepSourcePositions() {
+    // Test different theta angles
+    for (double theta = 120; theta <= 150; theta += 10) {
+        // Test different radii
+        for (double radius = 75; radius <= 95; radius += 10) {
+            std::cout << "\nTesting source at theta=" << theta << "°, radius=" << radius << " cm" << std::endl;
+            visualizeDetector(45.0, 0.0, theta, 0.0, radius);
+            // Add pause to let you examine each result
+            std::cout << "Press Enter to continue...";
+            std::cin.get();
+        }
+    }
 }

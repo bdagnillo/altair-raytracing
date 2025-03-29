@@ -266,10 +266,104 @@ void sweepDetector() {
     
     c->Update();
     
-    // Save flux map data to CSV
-    std::ofstream csvFile("fluxmap_data.csv");
-    csvFile << "theta,phi,fraction\n";  // Header
+    // Function to get a unique filename if the target file already exists
+    auto getUniqueFilename = [](const std::string& basePath) -> std::string {
+        // First check if file exists
+        FILE* file = fopen(basePath.c_str(), "r");
+        if (!file) {
+            // File doesn't exist, so we can use this name
+            return basePath;
+        }
+        fclose(file);
+        
+        // If file exists, find a unique name
+        std::string directory;
+        std::string filename;
+        
+        // Parse the path
+        size_t lastSlash = basePath.find_last_of("/\\");
+        if (lastSlash != std::string::npos) {
+            directory = basePath.substr(0, lastSlash + 1);
+            filename = basePath.substr(lastSlash + 1);
+        } else {
+            directory = "";
+            filename = basePath;
+        }
+        
+        // Split filename into stem and extension
+        size_t lastDot = filename.find_last_of('.');
+        std::string stem;
+        std::string extension;
+        if (lastDot != std::string::npos) {
+            stem = filename.substr(0, lastDot);
+            extension = filename.substr(lastDot);
+        } else {
+            stem = filename;
+            extension = "";
+        }
+        
+        // Find unique filename by incrementing counter
+        int counter = 1;
+        std::string newPath;
+        do {
+            newPath = directory + stem + "_" + std::to_string(counter) + extension;
+            counter++;
+            file = fopen(newPath.c_str(), "r");
+            if (file) {
+                fclose(file);
+            } else {
+                // Found a name that doesn't exist
+                break;
+            }
+        } while (true);
+        
+        return newPath;
+    };
     
+    // Save flux map data to CSV with improved format
+    const char* saveFolder = "results";
+    
+    // Create directory for results
+    std::string mkdirCmd = "mkdir -p \"" + std::string(saveFolder) + "\"";
+    int result = system(mkdirCmd.c_str());
+    if (result != 0) {
+        std::cerr << "Warning: Could not create directory: " << saveFolder << std::endl;
+    } else {
+        std::cout << "Using directory: " << saveFolder << std::endl;
+    }
+    
+    // Generate filename based on parameters
+    std::string filename = "fluxmap_data_" + std::to_string(n) + "rays_" + 
+                          std::to_string(nThetaBins * nPhiBins) + "points.csv";
+    std::string fullPath = std::string(saveFolder) + "/" + filename;
+    
+    // Get unique filename if already exists
+    fullPath = getUniqueFilename(fullPath);
+    
+    // Open CSV file with error checking
+    std::ofstream csvFile(fullPath);
+    if (!csvFile.is_open()) {
+        std::cerr << "Error: Could not open file " << fullPath << " for writing." << std::endl;
+        return;
+    }
+    
+    // Write metadata as comments in CSV
+    time_t now = time(nullptr);
+    struct tm* timeinfo = localtime(&now);
+    char timeBuffer[80];
+    strftime(timeBuffer, sizeof(timeBuffer), "%Y-%m-%d %H:%M:%S", timeinfo);
+    
+    csvFile << "# Flux Map Data - Generated: " << timeBuffer << std::endl;
+    csvFile << "# Number of rays per position: " << n << std::endl;
+    csvFile << "# Detector dimensions: 10cm x 10cm" << std::endl;
+    csvFile << "# Sphere inner radius: 100.1cm" << std::endl;
+    csvFile << "# Sphere outer radius: 101cm" << std::endl;
+    csvFile << "# Exit port angle: " << thetaMax << " degrees" << std::endl;
+    csvFile << "# Theta bins: " << nThetaBins << std::endl;
+    csvFile << "# Phi bins: " << nPhiBins << std::endl;
+    csvFile << "theta,phi,fraction" << std::endl;  // Header
+    
+    // Write data points
     for(int i = 0; i < nThetaBins; i++) {
         double theta = (i + 0.5) * 90.0/nThetaBins;
         for(int j = 0; j < nPhiBins; j++) {
@@ -279,9 +373,12 @@ void sweepDetector() {
                    << theta << "," << phi << "," << fraction << "\n";
         }
     }
+    
+    // Add execution time if a timer was used
+    csvFile << "# File saved at: " << timeBuffer << std::endl;
     csvFile.close();
     
-    std::cout << "\nFlux map data saved to 'fluxmap_data.csv'" << std::endl;
+    std::cout << "\nFlux map data saved to '" << fullPath << "'" << std::endl;
 }
 
 void visualizeDetector(double theta = 45.0, double phi = 0.0) {
