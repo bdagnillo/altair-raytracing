@@ -170,9 +170,35 @@ int traceRays(AOpticsManager* manager, int n, double exitPortZ, Detector& detect
     std::vector<TPolyLine3D*> rays;  // Store rays for visualization
     int hitCount = 0;  // Count of rays hitting the detector
     
+    // Draw a marker at the ray source position
+    if (drawRays) {
+        // Source position coordinates
+        double sourceX = -60*cm;
+        double sourceY = 0*cm;
+        double sourceZ = -80*cm;
+        
+        // Create a 3D marker at the ray source
+        TPolyMarker3D* sourceMarker = new TPolyMarker3D(1);
+        sourceMarker->SetPoint(0, sourceX, sourceY, sourceZ);
+        sourceMarker->SetMarkerColor(kMagenta);
+        sourceMarker->SetMarkerStyle(20);  // Filled circle
+        sourceMarker->SetMarkerSize(2.5);
+        sourceMarker->Draw();
+        
+        // Print information about the source position
+        std::cout << "Ray source position: (" << sourceX/cm << ", " 
+                  << sourceY/cm << ", " << sourceZ/cm << ") cm" << std::endl;
+    }
+    
     for (int i = 0; i < n; ++i) {
         double x = -60*cm;
-        ARay* ray = new ARay(0, 660*nm, x, 0*cm, -80*cm, 0, 5, 0, 0);
+        double y = 0*cm;
+        double z = -80*cm;
+        // Direction
+        double dirX = 5;
+        double dirY = 2;
+        double dirZ = 0;
+        ARay* ray = new ARay(0, 660*nm, x, y, z, 0, dirX, dirY, dirZ);
         manager->TraceNonSequential(*ray);
         
         if (drawRays) {
@@ -206,65 +232,35 @@ void sweepDetector() {
     AOpticsManager* manager = new AOpticsManager("manager", "spherical shell");
     setupOpticsManager(manager);
 
-    int n = 100000; // reduced number of rays per point for faster sweep
+    int n = 50000; // reduced number of rays per point for faster sweep
     double exitPortZ = -100*cm;
     
     // Create 2D histogram for the angular sweep
-    const int nThetaBins = 45;  // 2-degree steps in theta
-    const int nPhiBins = 20;    // 5-degree steps in phi
+    const int nThetaBins = 180;
+    const int nPhiBins = 90;
     TH2D* fluxMap = new TH2D("fluxMap", "Detector Flux Map;#theta (deg);#phi (deg)", 
                             nThetaBins, 0, 90, nPhiBins, 0, 360);
     
     // Create detector
     Detector detector;
     
-    // Perform the sweep
-    std::cout << "\nStarting detector sweep..." << std::endl;
-    std::cout << "Format: theta(°), phi(°): hits/total = fraction" << std::endl;
-    std::cout << "----------------------------------------" << std::endl;
+    // ----- SETUP CSV FILE BEFORE THE SWEEP BEGINS -----
+    // Save flux map data to CSV with improved format
+    const char* saveFolder = "results";
     
-    for(int i = 0; i < nThetaBins; i++) {
-        double theta = (i + 0.5) * 90.0/nThetaBins;
-        for(int j = 0; j < nPhiBins; j++) {
-            double phi = (j + 0.5) * 360.0/nPhiBins;
-            
-            detector.hitCount = 0; // reset counter
-            detector.setPosition(theta, phi, 100*cm);
-            
-            traceRays(manager, n, exitPortZ, detector);
-            
-            // Fix fraction calculation
-            double fraction = double(detector.hitCount)/double(n);
-            fluxMap->SetBinContent(i+1, j+1, fraction);
-            
-            // Detailed progress update
-            std::cout << std::fixed << std::setprecision(1)
-                     << theta << "°, " << phi << "°: "
-                     << detector.hitCount << "/" << n << " = "
-                     << std::setprecision(8) << fraction
-                     << std::endl;
-        }
-        // Add separator between theta values
-        std::cout << "----------------------------------------" << std::endl;
+    // Create directory for results
+    std::string mkdirCmd = "mkdir -p \"" + std::string(saveFolder) + "\"";
+    int result = system(mkdirCmd.c_str());
+    if (result != 0) {
+        std::cerr << "Warning: Could not create directory: " << saveFolder << std::endl;
+    } else {
+        std::cout << "Using directory: " << saveFolder << std::endl;
     }
     
-    // Create canvas and draw the histogram
-    TCanvas* c = new TCanvas("c", "Detector Flux Map", 1000, 800);
-    gStyle->SetOptStat(0);
-    gStyle->SetPalette(kRainBow);
-    
-    fluxMap->GetZaxis()->SetTitle("Fraction of rays detected");
-    fluxMap->Draw("COLZ");
-    
-    // Add color scale
-    gPad->Update();
-    TPaletteAxis* palette = (TPaletteAxis*)fluxMap->GetListOfFunctions()->FindObject("palette");
-    if(palette) {
-        palette->SetX1NDC(0.9);
-        palette->SetX2NDC(0.92);
-    }
-    
-    c->Update();
+    // Generate filename based on parameters
+    std::string filename = "fluxmap_data_" + std::to_string(n) + "rays_" + 
+                          std::to_string(nThetaBins * nPhiBins) + "points.csv";
+    std::string fullPath = std::string(saveFolder) + "/" + filename;
     
     // Function to get a unique filename if the target file already exists
     auto getUniqueFilename = [](const std::string& basePath) -> std::string {
@@ -320,23 +316,6 @@ void sweepDetector() {
         return newPath;
     };
     
-    // Save flux map data to CSV with improved format
-    const char* saveFolder = "results";
-    
-    // Create directory for results
-    std::string mkdirCmd = "mkdir -p \"" + std::string(saveFolder) + "\"";
-    int result = system(mkdirCmd.c_str());
-    if (result != 0) {
-        std::cerr << "Warning: Could not create directory: " << saveFolder << std::endl;
-    } else {
-        std::cout << "Using directory: " << saveFolder << std::endl;
-    }
-    
-    // Generate filename based on parameters
-    std::string filename = "fluxmap_data_" + std::to_string(n) + "rays_" + 
-                          std::to_string(nThetaBins * nPhiBins) + "points.csv";
-    std::string fullPath = std::string(saveFolder) + "/" + filename;
-    
     // Get unique filename if already exists
     fullPath = getUniqueFilename(fullPath);
     
@@ -361,24 +340,69 @@ void sweepDetector() {
     csvFile << "# Exit port angle: " << thetaMax << " degrees" << std::endl;
     csvFile << "# Theta bins: " << nThetaBins << std::endl;
     csvFile << "# Phi bins: " << nPhiBins << std::endl;
+    csvFile << "# y direction: 2" << std::endl;
     csvFile << "theta,phi,fraction" << std::endl;  // Header
     
-    // Write data points
+    std::cout << "\nStarting detector sweep..." << std::endl;
+    std::cout << "Format: theta(°), phi(°): hits/total = fraction" << std::endl;
+    std::cout << "----------------------------------------" << std::endl;
+    std::cout << "CSV file created: " << fullPath << std::endl;
+    
+    // ----- PERFORM THE SWEEP AND WRITE DATA AS WE GO -----
     for(int i = 0; i < nThetaBins; i++) {
         double theta = (i + 0.5) * 90.0/nThetaBins;
         for(int j = 0; j < nPhiBins; j++) {
             double phi = (j + 0.5) * 360.0/nPhiBins;
-            double fraction = fluxMap->GetBinContent(i+1, j+1);
+            
+            detector.hitCount = 0; // reset counter
+            detector.setPosition(theta, phi, 100*cm);
+            
+            traceRays(manager, n, exitPortZ, detector);
+            
+            // Fix fraction calculation
+            double fraction = double(detector.hitCount)/double(n);
+            fluxMap->SetBinContent(i+1, j+1, fraction);
+            
+            // Detailed progress update
+            std::cout << std::fixed << std::setprecision(1)
+                     << theta << "°, " << phi << "°: "
+                     << detector.hitCount << "/" << n << " = "
+                     << std::setprecision(8) << fraction
+                     << std::endl;
+            
+            // Write data to CSV file immediately
             csvFile << std::fixed << std::setprecision(6)
-                   << theta << "," << phi << "," << fraction << "\n";
+                   << theta << "," << phi << "," << fraction << std::endl;
+            // Flush to ensure data is written even if program crashes
+            csvFile.flush();
         }
+        // Add separator between theta values
+        std::cout << "----------------------------------------" << std::endl;
     }
     
-    // Add execution time if a timer was used
-    csvFile << "# File saved at: " << timeBuffer << std::endl;
+    // Add completion timestamp
+    csvFile << "# Sweep completed at: " << timeBuffer << std::endl;
     csvFile.close();
     
     std::cout << "\nFlux map data saved to '" << fullPath << "'" << std::endl;
+    
+    // Create canvas and draw the histogram
+    TCanvas* c = new TCanvas("c", "Detector Flux Map", 1000, 800);
+    gStyle->SetOptStat(0);
+    gStyle->SetPalette(kRainBow);
+    
+    fluxMap->GetZaxis()->SetTitle("Fraction of rays detected");
+    fluxMap->Draw("COLZ");
+    
+    // Add color scale
+    gPad->Update();
+    TPaletteAxis* palette = (TPaletteAxis*)fluxMap->GetListOfFunctions()->FindObject("palette");
+    if(palette) {
+        palette->SetX1NDC(0.9);
+        palette->SetX2NDC(0.92);
+    }
+    
+    c->Update();
 }
 
 void visualizeDetector(double theta = 45.0, double phi = 0.0) {

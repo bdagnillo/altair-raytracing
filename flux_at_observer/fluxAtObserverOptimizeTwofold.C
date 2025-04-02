@@ -332,6 +332,81 @@ int traceRaysParallel(AOpticsManager* manager, int n, double exitPortZ, Detector
     return hitCount;
 }
 
+// Modified function to trace rays and check intersection with two detectors
+int traceRaysParallelTwofold(AOpticsManager* manager, int n, double exitPortZ, 
+                            Detector& detector1, Detector& detector2, 
+                            bool drawRays = false, double x = -60*cm, double y = 0*cm, 
+                            double z = -80*cm, double dirX = 5, double dirY = 2, double dirZ = 0) {
+    int hitCount = 0;
+    
+    // Create an ARayArray for batch processing
+    ARayArray* rayArray = new ARayArray();
+    
+    // Fill the array with rays
+    for (int i = 0; i < n; ++i) {
+        ARay* ray = new ARay(i, 660*nm, x, y, z, 0, dirX, dirY, dirZ);
+        rayArray->Add(ray);
+    }
+    
+    // Let ROBAST handle multi-threading internally
+    manager->TraceNonSequential(rayArray);
+    
+    // Process results - check both detectors for each ray
+    TObjArray* stopped = rayArray->GetStopped();
+    TObjArray* exited = rayArray->GetExited();
+    
+    // Process stopped rays
+    for (int i = 0; i <= stopped->GetLast(); i++) {
+        ARay* ray = (ARay*)stopped->At(i);
+        if (!ray) continue;
+        
+        Double_t lastPoint[3];
+        ray->GetLastPoint(lastPoint);
+        
+        if (lastPoint[2] < exitPortZ) {
+            // Check first detector
+            if (detector1.checkIntersection(ray)) {
+                detector1.hitCount++;
+                hitCount++;
+            }
+            
+            // Check second detector
+            if (detector2.checkIntersection(ray)) {
+                detector2.hitCount++;
+                hitCount++;
+            }
+        }
+    }
+    
+    // Process exited rays
+    for (int i = 0; i <= exited->GetLast(); i++) {
+        ARay* ray = (ARay*)exited->At(i);
+        if (!ray) continue;
+        
+        Double_t lastPoint[3];
+        ray->GetLastPoint(lastPoint);
+        
+        if (lastPoint[2] < exitPortZ) {
+            // Check first detector
+            if (detector1.checkIntersection(ray)) {
+                detector1.hitCount++;
+                hitCount++;
+            }
+            
+            // Check second detector
+            if (detector2.checkIntersection(ray)) {
+                detector2.hitCount++;
+                hitCount++;
+            }
+        }
+    }
+    
+    // Clean up
+    delete rayArray;
+    
+    return hitCount;
+}
+
 // Function to get a unique filename if the target file already exists
 std::string getUniqueFilename(const std::string& basePath) {
     // First check if file exists
@@ -430,21 +505,44 @@ struct WorkChunk {
     int count;
 };
 
-void sweepDetector(bool notify = true, const char* saveFolder = "results", int threads = -1, 
+// Helper function to get current time formatted as string
+std::string getCurrentTimeString() {
+    time_t now = time(nullptr);
+    struct tm* timeinfo = localtime(&now);
+    char timeBuffer[80];
+    strftime(timeBuffer, sizeof(timeBuffer), "%H:%M:%S", timeinfo);
+    return std::string(timeBuffer);
+}
+
+// Add timing points to the sweepDetectorTwofold function
+void sweepDetectorTwofold(bool notify = true, const char* saveFolder = "results", int threads = -1, 
     double srcX = -60*cm, double srcY = 0*cm, double srcZ = -80*cm, double dirX = 5,
     double dirY = 2, double dirZ = 0, double thetaMax = THETA_MAX) {
+    
+    std::cout << "[DEBUG TIME " << getCurrentTimeString() << "] Starting sweep setup" << std::endl;
+    TStopwatch setupTimer;
+    setupTimer.Start();
+    
     // Initialize ROOT
     TThread::Initialize();
     
     // Track start and finish times
     time_t startTime = time(nullptr);
-    time_t finishTime; // Declaration for later use
+    time_t finishTime;
     
     // Create the geometry manager
     AOpticsManager* manager = new AOpticsManager("manager", "spherical shell");
     
     // Set up geometry
+    std::cout << "[DEBUG TIME " << getCurrentTimeString() << "] Starting geometry setup" << std::endl;
+    TStopwatch geometryTimer;
+    geometryTimer.Start();
+    
     setupOpticsManager(manager, MAX_REFLECTIONS, ROUGHNESS, REFLECTANCE, thetaMax, false);
+    
+    geometryTimer.Stop();
+    std::cout << "[DEBUG TIME " << getCurrentTimeString() << "] Geometry setup completed in " 
+              << geometryTimer.RealTime() << " seconds" << std::endl;
     
     // Configure internal threading for ray tracing
     if (std::thread::hardware_concurrency() > 1) {
@@ -469,8 +567,8 @@ void sweepDetector(bool notify = true, const char* saveFolder = "results", int t
         std::cout << "Using directory: " << saveFolder << std::endl;
     }
     
-    // Generate filename based on parameters
-    std::string filename = "fluxmap_" + std::to_string(n) + "rays_" + 
+    // Generate filename based on parameters with twofold indicator
+    std::string filename = "fluxmap_twofold_" + std::to_string(n) + "rays_" + 
                           std::to_string(nThetaBins) + "x" + std::to_string(nPhiBins) + 
                           "_src" + std::to_string(int(srcX/cm)) + "_" + 
                           std::to_string(int(srcY/cm)) + "_" + 
@@ -491,19 +589,23 @@ void sweepDetector(bool notify = true, const char* saveFolder = "results", int t
     TH2D* fluxMap = new TH2D("fluxMap", "Detector Flux Map;#theta (deg);#phi (deg)", 
                             nThetaBins, 0, 90, nPhiBins, 0, 360);
     
-    // Create detector - use a larger size to catch more rays
-    Detector detector(40*cm, 40*cm);
+    // Create two detectors - use a larger size to catch more rays
+    Detector detector1(40*cm, 40*cm);
+    Detector detector2(40*cm, 40*cm);
     int completedPositions = 0;
     
-    // Write metadata as comments in CSV
+    // Write CSV metadata
+    std::cout << "[DEBUG TIME " << getCurrentTimeString() << "] Writing file metadata" << std::endl;
+    
     time_t now = time(nullptr);
     struct tm* timeinfo = localtime(&now);
     char timeBuffer[80];
     strftime(timeBuffer, sizeof(timeBuffer), "%Y-%m-%d %H:%M:%S", timeinfo);
     
-    csvFile << "# Flux Map Data - Generated: " << timeBuffer << std::endl;
+    // Write metadata (header content unchanged)
+    csvFile << "# Flux Map Data (Twofold Method) - Generated: " << timeBuffer << std::endl;
     csvFile << "# Number of rays per position: " << n << std::endl;
-    csvFile << "# Detector dimensions: " << detector.width/cm << "cm x " << detector.height/cm << "cm" << std::endl;
+    csvFile << "# Detector dimensions: " << detector1.width/cm << "cm x " << detector1.height/cm << "cm" << std::endl;
     csvFile << "# Sphere inner radius: " << INNER_RADIUS/cm << "cm" << std::endl;
     csvFile << "# Sphere outer radius: " << OUTER_RADIUS/cm << "cm" << std::endl;
     csvFile << "# Exit port angle: " << thetaMax << " degrees" << std::endl;
@@ -515,11 +617,18 @@ void sweepDetector(bool notify = true, const char* saveFolder = "results", int t
     csvFile << "# Source position (x,y,z): " << srcX/cm << "cm, " << srcY/cm << "cm, " << srcZ/cm << "cm" << std::endl;
     csvFile << "# Source direction (x,y,z): " << dirX << ", " << dirY << ", " << dirZ << std::endl;
     csvFile << "# Max reflections: " << MAX_REFLECTIONS << std::endl;
+    csvFile << "# Method: Twofold (two detectors 180° apart)" << std::endl;
     csvFile << "theta,phi,fraction" << std::endl;  // Header
     
+    setupTimer.Stop();
+    std::cout << "[DEBUG TIME " << getCurrentTimeString() << "] Sweep setup completed in " 
+              << setupTimer.RealTime() << " seconds" << std::endl;
+    
     int totalPositions = nThetaBins * nPhiBins;
-    std::cout << "\nStarting detector sweep with " << n << " rays per position "
-              << "(" << totalPositions << " positions total)..." << std::endl;
+    // We only need to run half the phi angles
+    int actualRuns = nThetaBins * (nPhiBins/2);
+    std::cout << "\nStarting twofold detector sweep with " << n << " rays per position "
+              << "(" << actualRuns << " runs for " << totalPositions << " total positions)..." << std::endl;
     
     // Start timer for overall progress
     TStopwatch timer;
@@ -534,67 +643,108 @@ void sweepDetector(bool notify = true, const char* saveFolder = "results", int t
     std::deque<double> recentPointTimes;
     const int maxRecentPoints = 20;
 
-    // For debug - track total exiting rays
-    int totalExitRays = 0;
+    // For debug - track total ray hits
     int totalHitRays = 0;
 
-    // Process each position sequentially
+    // Process each position - using half the phi angles
     for(int i = 0; i < nThetaBins; i++) {
         thetaTimer.Start();
         double theta = (i + 0.5) * 90.0/nThetaBins;
-        std::cout << "\nProcessing theta angle: " << theta << "°" << std::endl;
+        std::cout << "\n[DEBUG TIME " << getCurrentTimeString() << "] Starting theta angle: " << theta << "°" << std::endl;
         
-        for(int j = 0; j < nPhiBins; j++) {
-            double phi = (j + 0.5) * 360.0/nPhiBins;
+        // Only need to process half the phi range because we're using two detectors
+        for(int j = 0; j < nPhiBins/2; j++) {
+            double phi1 = (j + 0.5) * 360.0/nPhiBins;
+            double phi2 = phi1 + 180.0;  // Second detector 180° opposite
             
-            // Display position being processed
-            std::cout << "  Processing position (θ=" << theta << "°, φ=" << phi << "°)..." << std::endl;
+            // Ensure phi2 is in range [0, 360)
+            if (phi2 >= 360.0) phi2 -= 360.0;
             
-            // Reset detector and position it
-            detector.hitCount = 0;
-            detector.setPosition(theta, phi, 100*cm);
+            // Display positions being processed
+            std::cout << "\n[DEBUG TIME " << getCurrentTimeString() << "] Processing positions (θ=" << theta 
+                      << "°, φ1=" << phi1 << "°, φ2=" << phi2 << "°)" << std::endl;
             
-            // Debug output for detector position
-            std::cout << "  Detector position (x,y,z): (" 
-                      << detector.x/cm << ", " << detector.y/cm << ", " << detector.z/cm 
-                      << ") cm with normal (" 
-                      << detector.nx << ", " << detector.ny << ", " << detector.nz << ")" << std::endl;
+            // Reset detectors and position them
+            std::cout << "[DEBUG TIME " << getCurrentTimeString() << "] Setting up detectors" << std::endl;
+            TStopwatch detectorSetupTimer;
+            detectorSetupTimer.Start();
+            
+            detector1.hitCount = 0;
+            detector2.hitCount = 0;
+            detector1.setPosition(theta, phi1, 100*cm);
+            detector2.setPosition(theta, phi2, 100*cm);
+            
+            detectorSetupTimer.Stop();
+            std::cout << "[DEBUG TIME " << getCurrentTimeString() << "] Detector setup completed in " 
+                      << detectorSetupTimer.RealTime() << " seconds" << std::endl;
+            
+            // Debug output for detector positions
+            std::cout << "  Detector 1 position (x,y,z): (" 
+                      << detector1.x/cm << ", " << detector1.y/cm << ", " << detector1.z/cm 
+                      << ") cm" << std::endl;
+            std::cout << "  Detector 2 position (x,y,z): (" 
+                      << detector2.x/cm << ", " << detector2.y/cm << ", " << detector2.z/cm 
+                      << ") cm" << std::endl;
             
             // Start timing this individual point
             TStopwatch pointTimer;
             pointTimer.Start();
 
-            // Process rays with PARALLEL version of traceRays
-            int hitCount = traceRaysParallel(manager, n, exitPortZ, detector, false, srcX, srcY, srcZ, dirX, dirY, dirZ);
+            // Process rays with twofold detector checking
+            std::cout << "[DEBUG TIME " << getCurrentTimeString() << "] Starting ray tracing for this position" << std::endl;
+            
+            int hitCount = traceRaysParallelTwofold(manager, n, exitPortZ, detector1, detector2, 
+                                                   false, srcX, srcY, srcZ, dirX, dirY, dirZ);
             totalHitRays += hitCount;
             
-            double fraction = double(detector.hitCount)/double(n);
+            std::cout << "[DEBUG TIME " << getCurrentTimeString() << "] Calculating fractions and updating results" << std::endl;
+            TStopwatch resultUpdateTimer;
+            resultUpdateTimer.Start();
             
-            // Update histogram and write to CSV
-            fluxMap->SetBinContent(i+1, j+1, fraction);
+            // Calculate fractions for both detectors
+            double fraction1 = double(detector1.hitCount)/double(n);
+            double fraction2 = double(detector2.hitCount)/double(n);
+            
+            // Find index for detector 2 position in histogram
+            int j2 = j + nPhiBins/2;
+            if (j2 >= nPhiBins) j2 -= nPhiBins;
+            
+            // Update histogram and write to CSV for both positions
+            fluxMap->SetBinContent(i+1, j+1, fraction1);
+            fluxMap->SetBinContent(i+1, j2+1, fraction2);
+            
             csvFile << std::fixed << std::setprecision(6) 
-                   << theta << "," << phi << "," << fraction << std::endl;
+                   << theta << "," << phi1 << "," << fraction1 << std::endl;
+            csvFile << std::fixed << std::setprecision(6) 
+                   << theta << "," << phi2 << "," << fraction2 << std::endl;
             
             // Flush to ensure data is written even if program crashes
             csvFile.flush();
             
-            // After the position is completed:
+            resultUpdateTimer.Stop();
+            std::cout << "[DEBUG TIME " << getCurrentTimeString() << "] Results update completed in " 
+                      << resultUpdateTimer.RealTime() << " seconds" << std::endl;
+            
+            // After the positions are completed:
             pointTimer.Stop();
             double pointTime = pointTimer.RealTime();
             recentPointTimes.push_back(pointTime);
             if (recentPointTimes.size() > maxRecentPoints) {
-                recentPointTimes.pop_front(); // Remove oldest time
+                recentPointTimes.pop_front();
             }
 
-            // Update position counter
-            completedPositions++;
+            // Update position counter - we've completed 2 positions
+            completedPositions += 2;
             
-            // Calculate and display progress
+            // Print progress (unchanged)
             double percentComplete = (100.0 * completedPositions) / totalPositions;
             std::cout << "  Progress: " << std::fixed << std::setprecision(1) 
                       << percentComplete << "% (" << completedPositions << "/" << totalPositions 
-                      << " positions), Hits: " << detector.hitCount << "/" << n 
-                      << " = " << std::setprecision(8) << fraction << std::endl;
+                      << " positions)" << std::endl;
+            std::cout << "  Detector 1 (φ=" << phi1 << "°): " << detector1.hitCount << "/" << n 
+                      << " = " << std::setprecision(8) << fraction1 << std::endl;
+            std::cout << "  Detector 2 (φ=" << phi2 << "°): " << detector2.hitCount << "/" << n 
+                      << " = " << std::setprecision(8) << fraction2 << std::endl;
 
             // Calculate estimated time based on average of recent points
             if (recentPointTimes.size() > 5) {
@@ -604,8 +754,9 @@ void sweepDetector(bool notify = true, const char* saveFolder = "results", int t
                 }
                 avgTimePerPoint /= recentPointTimes.size();
                 
-                int remainingPoints = totalPositions - completedPositions;
-                double remainingSeconds = avgTimePerPoint * remainingPoints;
+                // We're doing two positions per run, so divide remaining positions by 2
+                int remainingRuns = (totalPositions - completedPositions) / 2;
+                double remainingSeconds = avgTimePerPoint * remainingRuns;
                 
                 // Calculate estimated end time
                 time_t currentTime = time(nullptr);
@@ -632,9 +783,10 @@ void sweepDetector(bool notify = true, const char* saveFolder = "results", int t
         double thetaTime = thetaTimer.RealTime();
         thetaTimes.push_back(thetaTime);
         
-        std::cout << "Completed theta=" << theta << "° in " << thetaTime << " seconds" << std::endl;
+        std::cout << "[DEBUG TIME " << getCurrentTimeString() << "] Completed theta=" << theta 
+                  << "° in " << thetaTime << " seconds" << std::endl;
         
-        // Calculate estimated remaining time for theta angles
+        // Calculate estimated remaining time (unchanged)
         if (i < nThetaBins - 1) {
             double avgThetaTime = 0;
             for (double t : thetaTimes) {
@@ -655,10 +807,15 @@ void sweepDetector(bool notify = true, const char* saveFolder = "results", int t
     }
 
     // After sweep completes, add final metadata to file
+    std::cout << "[DEBUG TIME " << getCurrentTimeString() << "] Finalizing sweep and saving results" << std::endl;
+    TStopwatch finalizingTimer;
+    finalizingTimer.Start();
+    
     timer.Stop();
     double realTime = timer.RealTime();
     double cpuTime = timer.CpuTime();
     
+    // Finalize CSV file and canvas creation (unchanged)
     finishTime = time(nullptr);
     char finishTimeBuffer[80];
     struct tm* finishTimeInfo = localtime(&finishTime);
@@ -672,9 +829,11 @@ void sweepDetector(bool notify = true, const char* saveFolder = "results", int t
     std::cout << "\nFlux map data saved to '" << fullPath << "'" << std::endl;
     std::cout << "Sweep completed in " << realTime << " seconds (wall clock)" << std::endl;
     std::cout << "CPU time used: " << cpuTime << " seconds" << std::endl;
+    std::cout << "Efficiency gain: ~2x (processed " << totalPositions << " positions with " 
+              << actualRuns << " simulation runs)" << std::endl;
     
     // Create canvas and draw the histogram
-    TCanvas* c = new TCanvas("c", "Detector Flux Map", 1000, 800);
+    TCanvas* c = new TCanvas("c", "Detector Flux Map (Twofold Method)", 1000, 800);
     gStyle->SetOptStat(0);
     gStyle->SetPalette(kRainBow);
     
@@ -689,18 +848,21 @@ void sweepDetector(bool notify = true, const char* saveFolder = "results", int t
         palette->SetX2NDC(0.92);
     }
 
+    finalizingTimer.Stop();
+    std::cout << "[DEBUG TIME " << getCurrentTimeString() << "] Finalization completed in " 
+              << finalizingTimer.RealTime() << " seconds" << std::endl;
+    
     if (notify) {
-        // NOTIFICATION SYSTEM - Play a sound when sweep is complete
-        std::cout << "\n***** SWEEP COMPLETE *****\n" << std::endl;
-        
-        // Terminal bell (works in most terminals including WSL)
+        // NOTIFICATION SYSTEM
+        std::cout << "\n***** TWOFOLD SWEEP COMPLETE *****\n" << std::endl;
         std::cout << '\a' << std::endl;
     }
     
     // Clean up manager
+    std::cout << "[DEBUG TIME " << getCurrentTimeString() << "] Cleaning up manager" << std::endl;
     delete manager;
+    std::cout << "[DEBUG TIME " << getCurrentTimeString() << "] Sweep completed" << std::endl;
 }
-
 
 void visualizeDetector(double detTheta = 45.0, double detPhi = 0.0) {
     // Create canvas with square proportions
@@ -887,6 +1049,337 @@ void visualizeDetector(double detTheta = 45.0, double detPhi = 0.0) {
     c->Update();
 }
 
+// New optimized function using the trace-once approach
+void sweepDetectorTraceOnce(bool notify = true, const char* saveFolder = "results", int threads = -1, 
+    double srcX = -60*cm, double srcY = 0*cm, double srcZ = -80*cm, double dirX = 5,
+    double dirY = 2, double dirZ = 0, double thetaMax = THETA_MAX) {
+    
+    std::cout << "[DEBUG TIME " << getCurrentTimeString() << "] Starting sweep setup" << std::endl;
+    TStopwatch setupTimer;
+    setupTimer.Start();
+    
+    // Initialize ROOT and geometry as before
+    TThread::Initialize();
+    time_t startTime = time(nullptr);
+    AOpticsManager* manager = new AOpticsManager("manager", "spherical shell");
+    setupOpticsManager(manager, MAX_REFLECTIONS, ROUGHNESS, REFLECTANCE, thetaMax, false);
+    
+    // Configure threading
+    if (std::thread::hardware_concurrency() > 1) {
+        int maxRayThreads = std::max(1, std::min(4, (int)std::thread::hardware_concurrency()));
+        manager->SetMaxThreads(maxRayThreads);
+        std::cout << "Using " << maxRayThreads << " threads for ray tracing" << std::endl;
+    }
+    
+    // Configure parameters
+    int n = 100000; // rays total
+    double exitPortZ = -100*cm;
+    const int nThetaBins = 180;
+    const int nPhiBins = 90;
+    int totalPositions = nThetaBins * nPhiBins;
+    
+    // Create output directory and file
+    std::string mkdirCmd = "mkdir -p \"" + std::string(saveFolder) + "\"";
+    system(mkdirCmd.c_str());
+    
+    std::string filename = "fluxmap_traceonce_" + std::to_string(n) + "rays_" + 
+                          std::to_string(nThetaBins) + "x" + std::to_string(nPhiBins) + 
+                          "_src" + std::to_string(int(srcX/cm)) + "_" + 
+                          std::to_string(int(srcY/cm)) + "_" + 
+                          std::to_string(int(srcZ/cm)) + ".csv";
+    std::string fullPath = std::string(saveFolder) + "/" + filename;
+    fullPath = getUniqueFilename(fullPath);
+    
+    // Buffer for CSV data
+    std::stringstream csvBuffer;
+    
+    // Write metadata
+    time_t now = time(nullptr);
+    struct tm* timeinfo = localtime(&now);
+    char timeBuffer[80];
+    strftime(timeBuffer, sizeof(timeBuffer), "%Y-%m-%d %H:%M:%S", timeinfo);
+    
+    csvBuffer << "# Flux Map Data (Trace-Once Method) - Generated: " << timeBuffer << std::endl;
+    csvBuffer << "# Number of rays: " << n << std::endl;
+    csvBuffer << "# Detector dimensions: 40cm x 40cm" << std::endl;
+    csvBuffer << "# Sphere inner radius: " << INNER_RADIUS/cm << "cm" << std::endl;
+    csvBuffer << "# Sphere outer radius: " << OUTER_RADIUS/cm << "cm" << std::endl;
+    csvBuffer << "# Exit port angle: " << thetaMax << " degrees" << std::endl;
+    csvBuffer << "# Theta bins: " << nThetaBins << std::endl;
+    csvBuffer << "# Phi bins: " << nPhiBins << std::endl;
+    csvBuffer << "# Mirror reflectance: " << REFLECTANCE << std::endl;
+    csvBuffer << "# Gaussian roughness: " << ROUGHNESS << std::endl;
+    csvBuffer << "# Lambertian scattering: enabled" << std::endl;
+    csvBuffer << "# Source position (x,y,z): " << srcX/cm << "cm, " << srcY/cm << "cm, " << srcZ/cm << "cm" << std::endl;
+    csvBuffer << "# Source direction (x,y,z): " << dirX << ", " << dirY << ", " << dirZ << std::endl;
+    csvBuffer << "# Max reflections: " << MAX_REFLECTIONS << std::endl;
+    csvBuffer << "# Method: Trace-Once (single trace, multiple detector positions)" << std::endl;
+    csvBuffer << "theta,phi,fraction" << std::endl;
+    
+    // Create histogram for results
+    TH2D* fluxMap = new TH2D("fluxMap", "Detector Flux Map (Trace-Once Method);#theta (deg);#phi (deg)", 
+                            nThetaBins, 0, 90, nPhiBins, 0, 360);
+    
+    // ----- TRACE RAYS ONCE -----
+    std::cout << "[DEBUG TIME " << getCurrentTimeString() << "] Tracing all rays once" << std::endl;
+    TStopwatch rayTraceTimer;
+    rayTraceTimer.Start();
+    
+    // Create an ARayArray for batch processing
+    ARayArray* rayArray = new ARayArray();
+    
+    // Fill the array with rays
+    for (int i = 0; i < n; ++i) {
+        ARay* ray = new ARay(i, 660*nm, srcX, srcY, srcZ, 0, dirX, dirY, dirZ);
+        rayArray->Add(ray);
+    }
+    
+    // Trace all rays at once
+    manager->TraceNonSequential(rayArray);
+    
+    // Structure to store ray endpoints for intersection testing
+    struct RayEndpoint {
+        double start[3];  // Starting point of final segment
+        double end[3];    // End point (ray exit position)
+        double dir[3];    // Direction of final segment
+    };
+    std::vector<RayEndpoint> exitedRays;
+    
+    // Process stopped rays
+    TObjArray* stopped = rayArray->GetStopped();
+    for (int i = 0; i <= stopped->GetLast(); i++) {
+        ARay* ray = (ARay*)stopped->At(i);
+        if (!ray) continue;
+        
+        Double_t lastPoint[3];
+        ray->GetLastPoint(lastPoint);
+        
+        if (lastPoint[2] < exitPortZ) {
+            // We only need the final ray segment for detector intersection
+            RayEndpoint endpoint;
+            
+            // Get last two points to determine the final segment
+            int nPoints = ray->GetNpoints();
+            if (nPoints >= 2) {
+                // Get second-to-last point as segment start
+                Double_t secondLastPoint[3];
+                ray->GetPoint(nPoints - 2, secondLastPoint);
+                
+                // Copy points to our storage
+                endpoint.start[0] = secondLastPoint[0];
+                endpoint.start[1] = secondLastPoint[1];
+                endpoint.start[2] = secondLastPoint[2];
+                
+                endpoint.end[0] = lastPoint[0];
+                endpoint.end[1] = lastPoint[1];
+                endpoint.end[2] = lastPoint[2];
+                
+                // Calculate direction from the two points
+                double dx = lastPoint[0] - secondLastPoint[0];
+                double dy = lastPoint[1] - secondLastPoint[1];
+                double dz = lastPoint[2] - secondLastPoint[2];
+                
+                // Normalize direction
+                double mag = sqrt(dx*dx + dy*dy + dz*dz);
+                endpoint.dir[0] = dx/mag;
+                endpoint.dir[1] = dy/mag;
+                endpoint.dir[2] = dz/mag;
+                
+                // Store this endpoint
+                exitedRays.push_back(endpoint);
+            }
+        }
+    }
+    
+    // Process exited rays (similar to stopped rays)
+    TObjArray* exited = rayArray->GetExited();
+    for (int i = 0; i <= exited->GetLast(); i++) {
+        ARay* ray = (ARay*)exited->At(i);
+        if (!ray) continue;
+        
+        Double_t lastPoint[3];
+        ray->GetLastPoint(lastPoint);
+        
+        if (lastPoint[2] < exitPortZ) {
+            // Same process as for stopped rays
+            RayEndpoint endpoint;
+            
+            int nPoints = ray->GetNpoints();
+            if (nPoints >= 2) {
+                Double_t secondLastPoint[3];
+                ray->GetPoint(nPoints - 2, secondLastPoint);
+                
+                endpoint.start[0] = secondLastPoint[0];
+                endpoint.start[1] = secondLastPoint[1];
+                endpoint.start[2] = secondLastPoint[2];
+                
+                endpoint.end[0] = lastPoint[0];
+                endpoint.end[1] = lastPoint[1];
+                endpoint.end[2] = lastPoint[2];
+                
+                double dx = lastPoint[0] - secondLastPoint[0];
+                double dy = lastPoint[1] - secondLastPoint[1];
+                double dz = lastPoint[2] - secondLastPoint[2];
+                
+                double mag = sqrt(dx*dx + dy*dy + dz*dz);
+                endpoint.dir[0] = dx/mag;
+                endpoint.dir[1] = dy/mag;
+                endpoint.dir[2] = dz/mag;
+                
+                exitedRays.push_back(endpoint);
+            }
+        }
+    }
+    
+    // Clean up ray array as we no longer need the original ray objects
+    delete rayArray;
+    
+    rayTraceTimer.Stop();
+    std::cout << "[DEBUG TIME " << getCurrentTimeString() << "] Ray tracing completed in " 
+              << rayTraceTimer.RealTime() << " seconds" << std::endl;
+    std::cout << "Total rays exiting port: " << exitedRays.size() << " out of " << n << std::endl;
+    
+    // ----- TEST AGAINST ALL DETECTOR POSITIONS -----
+    std::cout << "[DEBUG TIME " << getCurrentTimeString() << "] Starting detector position sweep" << std::endl;
+    TStopwatch sweepTimer;
+    sweepTimer.Start();
+    
+    // Use vector to store results
+    std::vector<std::tuple<double, double, double>> results;
+    results.reserve(1000); // Reserve space for batched results
+    
+    int completedPositions = 0;
+    
+    // Process each position
+    for(int i = 0; i < nThetaBins; i++) {
+        double theta = (i + 0.5) * 90.0/nThetaBins;
+        
+        for(int j = 0; j < nPhiBins; j++) {
+            double phi = (j + 0.5) * 360.0/nPhiBins;
+            
+            // Create detector at this position
+            Detector detector(40*cm, 40*cm);
+            detector.setPosition(theta, phi, 100*cm);
+            
+            // Count hits for this detector position
+            int hitCount = 0;
+            
+            // Optimized intersection testing
+            for (const auto& endpoint : exitedRays) {
+                // Create temporary ray for testing
+                ARay tempRay(0, 660*nm, 
+                            endpoint.start[0], endpoint.start[1], endpoint.start[2], 
+                            0, 
+                            endpoint.dir[0], endpoint.dir[1], endpoint.dir[2]);
+                
+                // Check intersection
+                if (detector.checkIntersection(&tempRay)) {
+                    hitCount++;
+                }
+            }
+            
+            // Calculate fraction
+            double fraction = double(hitCount) / double(n);
+            
+            // Store result
+            results.push_back(std::make_tuple(theta, phi, fraction));
+            
+            // Update histogram
+            fluxMap->SetBinContent(i+1, j+1, fraction);
+            
+            // Update progress counter
+            completedPositions++;
+            
+            // Print progress every 100 positions
+            if (completedPositions % 100 == 0 || completedPositions == totalPositions) {
+                double percentComplete = (100.0 * completedPositions) / totalPositions;
+                std::cout << "[DEBUG TIME " << getCurrentTimeString() << "] Progress: " 
+                          << std::fixed << std::setprecision(1) << percentComplete << "% (" 
+                          << completedPositions << "/" << totalPositions << " positions)" << std::endl;
+            }
+        }
+        
+        // Write accumulated results every 10 theta angles
+        if (i % 10 == 9 || i == nThetaBins - 1) {
+            std::cout << "[DEBUG TIME " << getCurrentTimeString() << "] Writing batch of results to CSV" << std::endl;
+            
+            for (const auto& result : results) {
+                csvBuffer << std::fixed << std::setprecision(6)
+                         << std::get<0>(result) << ","
+                         << std::get<1>(result) << ","
+                         << std::get<2>(result) << std::endl;
+            }
+            
+            // Write to file
+            std::ofstream csvFile(fullPath, std::ios::trunc);
+            if (csvFile.is_open()) {
+                csvFile << csvBuffer.str();
+                csvFile.close();
+            } else {
+                std::cerr << "Error: Could not open file " << fullPath << " for writing." << std::endl;
+            }
+            
+            // Clear results vector to free memory
+            results.clear();
+            results.reserve(1000);
+        }
+    }
+    
+    sweepTimer.Stop();
+    double sweepTime = sweepTimer.RealTime();
+    double rayTime = rayTraceTimer.RealTime();
+    double totalTime = setupTimer.RealTime() + rayTime + sweepTime;
+    
+    // After sweep completes, create visualization and print stats
+    std::cout << "[DEBUG TIME " << getCurrentTimeString() << "] Finalizing results" << std::endl;
+    
+    // Create canvas and draw the histogram
+    TCanvas* c = new TCanvas("c", "Detector Flux Map (Trace-Once Method)", 1000, 800);
+    gStyle->SetOptStat(0);
+    gStyle->SetPalette(kRainBow);
+    
+    fluxMap->GetZaxis()->SetTitle("Fraction of rays detected");
+    fluxMap->Draw("COLZ");
+    
+    // Add color scale
+    gPad->Update();
+    TPaletteAxis* palette = (TPaletteAxis*)fluxMap->GetListOfFunctions()->FindObject("palette");
+    if(palette) {
+        palette->SetX1NDC(0.9);
+        palette->SetX2NDC(0.92);
+    }
+    
+    // Add final metadata to CSV
+    time_t finishTime = time(nullptr);
+    char finishTimeBuffer[80];
+    struct tm* finishTimeInfo = localtime(&finishTime);
+    strftime(finishTimeBuffer, sizeof(finishTimeBuffer), "%Y-%m-%d %H:%M:%S", finishTimeInfo);
+    
+    // Append to CSV file
+    std::ofstream csvFileAppend(fullPath, std::ios::app);
+    if (csvFileAppend.is_open()) {
+        csvFileAppend << "# Sweep completed at: " << finishTimeBuffer << std::endl;
+        csvFileAppend << "# Total execution time: " << totalTime << " seconds" << std::endl;
+        csvFileAppend << "# Ray tracing time: " << rayTime << " seconds" << std::endl;
+        csvFileAppend << "# Detector sweep time: " << sweepTime << " seconds" << std::endl;
+        csvFileAppend << "# Total rays exiting port: " << exitedRays.size() << " out of " << n << std::endl;
+        csvFileAppend.close();
+    }
+    
+    std::cout << "\nFlux map data saved to '" << fullPath << "'" << std::endl;
+    std::cout << "Ray tracing completed in " << rayTime << " seconds" << std::endl;
+    std::cout << "Detector sweep completed in " << sweepTime << " seconds" << std::endl;
+    std::cout << "Total execution time: " << totalTime << " seconds" << std::endl;
+    
+    if (notify) {
+        // NOTIFICATION SYSTEM
+        std::cout << "\n***** TRACE-ONCE SWEEP COMPLETE *****\n" << std::endl;
+        std::cout << '\a' << std::endl;
+    }
+    
+    // Clean up manager
+    delete manager;
+}
 
 
 void sweepSeries(){
@@ -897,7 +1390,7 @@ void sweepSeries(){
     const double dirXBase = 5;
     
     // Create a results directory with the base parameters in the name
-    std::string baseFolder = "results_overnight_04_1" + 
+    std::string baseFolder = "trace_once_test_04_2" + 
                             std::to_string(int(srcX/cm)) + "_" +
                             std::to_string(int(srcY/cm)) + "_" +
                             std::to_string(int(srcZ/cm)) + "_" +
@@ -911,13 +1404,16 @@ void sweepSeries(){
     // sweepDetector(false, baseFolder.c_str(), 1, srcX, srcY, srcZ, dirXBase, 8, 0);
 
     // Series different exit port sizes
-    sweepDetector(false, baseFolder.c_str(), 1, srcX, srcY, srcZ, dirXBase, 0, 0, 163);
-    sweepDetector(false, baseFolder.c_str(), 1, srcX, srcY, srcZ, dirXBase, 0, 0, 166);
-    sweepDetector(false, baseFolder.c_str(), 1, srcX, srcY, srcZ, dirXBase, 0, 0, 169);
-    sweepDetector(false, baseFolder.c_str(), 1, srcX, srcY, srcZ, dirXBase, 0, 0, 172);
-    sweepDetector(false, baseFolder.c_str(), 1, srcX, srcY, srcZ, dirXBase, 0, 0, 175);
-    sweepDetector(false, baseFolder.c_str(), 1, srcX, srcY, srcZ, dirXBase, 0, 0, 178);
+    // sweepDetector(false, baseFolder.c_str(), 1, srcX, srcY, srcZ, dirXBase, 0, 0, 163);
+    // sweepDetector(false, baseFolder.c_str(), 1, srcX, srcY, srcZ, dirXBase, 0, 0, 166);
+    // sweepDetector(false, baseFolder.c_str(), 1, srcX, srcY, srcZ, dirXBase, 0, 0, 169);
+    // sweepDetector(false, baseFolder.c_str(), 1, srcX, srcY, srcZ, dirXBase, 0, 0, 172);
+    // sweepDetector(false, baseFolder.c_str(), 1, srcX, srcY, srcZ, dirXBase, 0, 0, 175);
+    // sweepDetector(false, baseFolder.c_str(), 1, srcX, srcY, srcZ, dirXBase, 0, 0, 178);
 
+    sweepDetectorTraceOnce(false, baseFolder.c_str(), 1, srcX, srcY, srcZ, dirXBase, 0, 0);
+    sweepDetectorTraceOnce(false, baseFolder.c_str(), 1, srcX, srcY, srcZ, dirXBase, 0, 0);
+    sweepDetectorTraceOnce(false, baseFolder.c_str(), 1, srcX, srcY, srcZ, dirXBase, 0, 0);
+    sweepDetectorTraceOnce(false, baseFolder.c_str(), 1, srcX, srcY, srcZ, dirXBase, 0, 0);
+    sweepDetectorTraceOnce(false, baseFolder.c_str(), 1, srcX, srcY, srcZ, dirXBase, 0, 0);
 }
-
-

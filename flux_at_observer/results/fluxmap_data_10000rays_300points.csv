@@ -1,0 +1,15 @@
+# Flux Map Data - Generated: 2025-03-30 11:08:33
+# Number of rays per position: 10000
+# Detector dimensions: 10cm x 10cm
+# Sphere inner radius: 100.1cm
+# Sphere outer radius: 101cm
+# Exit port angle: 170 degrees
+# Theta bins: 15
+# Phi bins: 20
+theta,phi,fraction
+3.000000,9.000000,0.002000
+3.000000,27.000000,0.002800
+3.000000,45.000000,0.002500
+3.000000,63.000000,0.002200
+3.000000,81.000000,0.002400
+3.000000,99.000000,0.002600

@@ -1,0 +1,22 @@
+# Detector Data - Generated: 2025-04-01 00:10:22
+# Number of rays: 50000
+# Detector dimensions: 20cm x 20cm
+# Sphere inner radius: 100.1cm
+# Sphere outer radius: 101cm
+# Exit port angle: 170 degrees
+# Theta bins: 90
+# Phi bins: 180
+# Mirror reflectance: 0.99
+# Gaussian roughness: 0.01
+# Lambertian scattering: enabled
+# Source position (x,y,z): -60cm, 0cm, -80cm
+# Source direction (x,y,z): 5, 2, 0
+# Max reflections: 50000
+theta,phi,fraction
+0.500000,1.000000,0.000000
+0.500000,3.000000,0.000000
+0.500000,5.000000,0.000000
+0.500000,7.000000,0.000000
+0.500000,9.000000,0.000000
+0.500000,11.000000,0.000000
+0.500000,13.000000,0.000000

@@ -1,0 +1,36 @@
+# Flux Map Data (Twofold Method) - Generated: 2025-04-02 13:39:57
+# Number of rays per position: 50000
+# Detector dimensions: 40cm x 40cm
+# Sphere inner radius: 100.1cm
+# Sphere outer radius: 101cm
+# Exit port angle: 170 degrees
+# Theta bins: 180
+# Phi bins: 90
+# Mirror reflectance: 0.99
+# Gaussian roughness: 0.01
+# Lambertian scattering: enabled
+# Source position (x,y,z): -60cm, 0cm, -80cm
+# Source direction (x,y,z): 5, 2, 0
+# Max reflections: 50000
+# Method: Twofold (two detectors 180° apart)
+theta,phi,fraction
+0.250000,2.000000,0.015080
+0.250000,182.000000,0.015240
+0.250000,6.000000,0.015580
+0.250000,186.000000,0.015540
+0.250000,10.000000,0.015180
+0.250000,190.000000,0.015060
+0.250000,14.000000,0.014320
+0.250000,194.000000,0.014500
+0.250000,18.000000,0.014940
+0.250000,198.000000,0.014920
+0.250000,22.000000,0.015760
+0.250000,202.000000,0.015880
+0.250000,26.000000,0.016040
+0.250000,206.000000,0.016140
+0.250000,30.000000,0.015340
+0.250000,210.000000,0.015180
+0.250000,34.000000,0.016180
+0.250000,214.000000,0.016280
+0.250000,38.000000,0.015540
+0.250000,218.000000,0.015540
