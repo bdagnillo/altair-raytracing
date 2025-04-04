@@ -983,6 +983,21 @@ void visualizeDetector(double detTheta = 45.0, double detPhi = 0.0) {
             }
         } else {
             pol->SetLineColor(kRed);
+            if (lastPoint[2] >= exitPortZ) {
+                // This is a "reflected back" ray
+                pol->SetLineColor(kRed);
+                pol->SetLineWidth(5);  // Make thicker
+                
+                // Add a marker at the endpoint
+                TMarker* marker = new TMarker(lastPoint[0], lastPoint[1], 20);
+                marker->SetMarkerColor(kRed);
+                marker->SetMarkerStyle(20);  // Solid circle
+                marker->SetMarkerSize(2);
+                marker->Draw();
+                
+                std::cout << "Red ray endpoint: (" << lastPoint[0]/cm << ", " 
+                          << lastPoint[1]/cm << ", " << lastPoint[2]/cm << ") cm" << std::endl;
+            }
         }
         
         pol->SetLineWidth(3);
@@ -1381,6 +1396,247 @@ void sweepDetectorTraceOnce(bool notify = true, const char* saveFolder = "result
     delete manager;
 }
 
+// Updated visualization function with option to show only red rays
+void visualizeDetector(double detTheta = 45.0, double detPhi = 0.0, bool onlyShowRedRays = false) {
+    // Create canvas with square proportions
+    TCanvas* c = new TCanvas("cvis", "Detector Visualization", 800, 800);
+    c->cd();
+    
+    AOpticsManager* manager = new AOpticsManager("manager", "spherical shell");
+    
+    double angle = 150.0;
+    // Setup geometry using our standard function
+    setupOpticsManager(manager, MAX_REFLECTIONS, ROUGHNESS, REFLECTANCE, angle, true);
+    
+    // Create and position detector
+    Detector detector(20*cm, 20*cm);
+    detector.setPosition(detTheta, detPhi, 100*cm);
+    
+    // Add detector to geometry
+    TGeoVolume* vol = manager->GetTopVolume();
+    AOpticalComponent* world = dynamic_cast<AOpticalComponent*>(vol);
+    if (!world) {
+        std::cerr << "Error: Top volume is not an AOpticalComponent" << std::endl;
+        return;
+    }
+    detector.AddToGeometry(world);
+    
+    // Close the geometry after all components are added
+    manager->CloseGeometry();
+    
+    // Source position
+    double srcX = -60*cm;
+    double srcY = 0*cm;
+    double srcZ = -75*cm;
+    
+    // Direction
+    double dirX = 5;
+    double dirY = 0;
+    double dirZ = 0;
+    
+    // Create source marker
+    TGeoSphere* sourceSphere = new TGeoSphere("sourceSphere", 0, 3*cm);
+    TGeoVolume* sourceVol = new TGeoVolume("source", sourceSphere);
+    sourceVol->SetLineColor(kRed);
+    sourceVol->SetFillColor(kRed);
+    world->AddNode(sourceVol, 1, new TGeoTranslation(srcX, srcY, srcZ));
+    
+    // Set up the 3D viewer
+    gStyle->SetCanvasPreferGL(true);
+    world->Draw("ogl");
+    
+    // Get viewer and set initial properties
+    TGLViewer* glv = (TGLViewer*)gPad->GetViewer3D();
+    if (glv) {
+        glv->SetStyle(TGLRnrCtx::kWireFrame);
+        glv->UpdateScene();
+    }
+    
+    c->Update();
+    gSystem->ProcessEvents();
+    gSystem->Sleep(500); // Give time for the viewer to initialize
+    
+    // Create a transparent pad for rays
+    TPad* rayPad = new TPad("rayPad", "Ray Visualization", 0, 0, 1, 1);
+    rayPad->SetFillStyle(4000); // Transparent
+    rayPad->Draw();
+    rayPad->cd();
+    
+    // Draw rays with our parallel tracing function
+    int n = onlyShowRedRays ? 5000 : 1000; // More rays when showing only red rays
+    double exitPortZ = -100*cm;
+    detector.hitCount = 0;
+    
+    // We need to trace the rays first, then manually create polylines
+    ARayArray* rayArray = new ARayArray();
+    
+    // Fill the array with rays
+    for (int i = 0; i < n; ++i) {
+        ARay* ray = new ARay(i, 660*nm, srcX, srcY, srcZ, 0, dirX, dirY, dirZ);
+        rayArray->Add(ray);
+    }
+    
+    // Trace rays
+    manager->TraceNonSequential(rayArray);
+    
+    // Process results and draw rays
+    TObjArray* stopped = rayArray->GetStopped();
+    TObjArray* exited = rayArray->GetExited();
+    
+    int exitCount = 0;
+    int hitCount = 0;
+    int suspendedCount = 0;
+    int absorbedCount = 0;
+    int reflectedBackCount = 0;
+    std::vector<TPolyLine3D*> rayLines; // Store to prevent garbage collection
+    
+    std::cout << "\nProcessing stopped rays..." << std::endl;
+    // Process stopped rays
+    for (int i = 0; i <= stopped->GetLast(); i++) {
+        ARay* ray = (ARay*)stopped->At(i);
+        if (!ray) continue;
+        
+        Double_t lastPoint[3];
+        ray->GetLastPoint(lastPoint);
+        
+        bool isRed = false;
+        
+        if (ray->IsSuspended()) {
+            suspendedCount++;
+            if (onlyShowRedRays) continue; // Skip if only showing red rays
+        } else if (ray->IsAbsorbed()) {
+            absorbedCount++;
+            if (onlyShowRedRays) continue; // Skip if only showing red rays
+        } else if (lastPoint[2] < exitPortZ) {
+            exitCount++;
+            if (detector.checkIntersection(ray)) {
+                detector.hitCount++;
+                hitCount++;
+            }
+            if (onlyShowRedRays) continue; // Skip if only showing red rays
+        } else {
+            // This is a red ray (reflected back)
+            reflectedBackCount++;
+            isRed = true;
+        }
+        
+        // If we're only showing red rays and this isn't red, skip
+        if (onlyShowRedRays && !isRed) continue;
+        
+        TPolyLine3D* pol = ray->MakePolyLine3D();
+        
+        if (isRed) {
+            // Enhanced styling for red rays
+            pol->SetLineColor(kRed);
+            pol->SetLineWidth(onlyShowRedRays ? 4 : 3);
+            
+            // If only showing red rays, add endpoint markers
+            if (onlyShowRedRays) {
+                // Add a marker at the last point
+                TMarker* marker = new TMarker(lastPoint[0]/cm, lastPoint[1]/cm, 20);
+                marker->SetMarkerColor(kRed);
+                marker->SetMarkerStyle(20);  // Solid circle
+                marker->SetMarkerSize(1.5);
+                marker->Draw();
+                
+                std::cout << "Red ray endpoint: (" << lastPoint[0]/cm << ", " 
+                          << lastPoint[1]/cm << ", " << lastPoint[2]/cm << ") cm" << std::endl;
+            }
+        } else {
+            // Standard coloring for other rays
+            if (ray->IsSuspended()) {
+                pol->SetLineColor(kMagenta);
+            } else if (ray->IsAbsorbed()) {
+                pol->SetLineColor(kBlack);
+            } else if (detector.checkIntersection(ray)) {
+                pol->SetLineColor(kGreen);
+            } else {
+                pol->SetLineColor(kYellow);
+            }
+        }
+        
+        pol->SetLineWidth(2);
+        pol->Draw();
+        rayLines.push_back(pol);
+    }
+    
+    // Process exited rays (only if not in red-only mode)
+    if (!onlyShowRedRays) {
+        for (int i = 0; i <= exited->GetLast(); i++) {
+            ARay* ray = (ARay*)exited->At(i);
+            if (!ray) continue;
+            
+            TPolyLine3D* pol = ray->MakePolyLine3D();
+            
+            Double_t lastPoint[3];
+            ray->GetLastPoint(lastPoint);
+            
+            if (lastPoint[2] < exitPortZ) {
+                exitCount++;
+                if (detector.checkIntersection(ray)) {
+                    pol->SetLineColor(kGreen);
+                    detector.hitCount++;
+                    hitCount++;
+                } else {
+                    pol->SetLineColor(kYellow);
+                }
+            } else {
+                pol->SetLineColor(kRed);
+                reflectedBackCount++;
+            }
+            
+            pol->SetLineWidth(2);
+            pol->Draw();
+            rayLines.push_back(pol);
+        }
+    }
+    
+    // Clean up ray array
+    delete rayArray;
+    
+    rayPad->Modified();
+    rayPad->Update();
+    c->Update();
+    
+    // Print statistics
+    std::string mode = onlyShowRedRays ? "RED RAYS ONLY MODE" : "STANDARD VISUALIZATION";
+    std::cout << "\n=== " << mode << " ===" << std::endl;
+    std::cout << "Detector Information:" << std::endl;
+    std::cout << "Total rays: " << n << std::endl;
+    std::cout << "Rays exiting port: " << exitCount << std::endl;
+    std::cout << "Rays hitting detector: " << hitCount << "/" << exitCount << " of exiting rays" << std::endl;
+    std::cout << "Rays suspended: " << suspendedCount << std::endl;
+    std::cout << "Rays absorbed: " << absorbedCount << std::endl;
+    std::cout << "Rays reflected back: " << reflectedBackCount << std::endl;
+    std::cout << "Position (x,y,z): (" << detector.x/cm << ", " << detector.y/cm << ", " << detector.z/cm << ") cm" << std::endl;
+    
+    // Add legend appropriate to the mode
+    TPaveText* legend = new TPaveText(0.7, 0.7, 0.9, 0.9, "NDC");
+    legend->SetFillColor(kWhite);
+    legend->SetTextAlign(12);
+    
+    if (onlyShowRedRays) {
+        legend->AddText("RED RAYS ONLY MODE");
+        legend->AddText("Red: Rays that did not exit port");
+        legend->AddText(Form("Count: %d / %d rays", reflectedBackCount, n));
+        legend->AddText(Form("%.1f%% of total rays", 100.0 * reflectedBackCount / n));
+    } else {
+        legend->AddText("Green: Hit detector");
+        legend->AddText("Yellow: Exit port, miss detector");
+        legend->AddText("Red: Did not exit port");
+        legend->AddText("Magenta: Suspended (max reflections)");
+        legend->AddText("Black: Absorbed");
+    }
+    
+    legend->Draw();
+    
+    c->Update();
+}
+
+// Helper function specifically for examining red rays in detail
+void showRedRaysOnly() {
+    visualizeDetector(45.0, 0.0, true);
+}
 
 void sweepSeries(){
     // Run sweeps for different source angles - using parameters instead of hardcoded values
@@ -1388,13 +1644,14 @@ void sweepSeries(){
     const double srcY = 0*cm;
     const double srcZ = -75*cm;
     const double dirXBase = 5;
+    const double portAngle = 164.0; // degrees
     
     // Create a results directory with the base parameters in the name
-    std::string baseFolder = "trace_once_test_04_2" + 
+    std::string baseFolder = "portAngleSweep_04_03_" + 
                             std::to_string(int(srcX/cm)) + "_" +
                             std::to_string(int(srcY/cm)) + "_" +
                             std::to_string(int(srcZ/cm)) + "_" +
-                            std::to_string(int(dirXBase));
+                            std::to_string(int(portAngle));
     
     // Series different source angles
     // sweepDetector(false, baseFolder.c_str(), 1, srcX, srcY, srcZ, dirXBase, 0, 0);
@@ -1404,16 +1661,13 @@ void sweepSeries(){
     // sweepDetector(false, baseFolder.c_str(), 1, srcX, srcY, srcZ, dirXBase, 8, 0);
 
     // Series different exit port sizes
-    // sweepDetector(false, baseFolder.c_str(), 1, srcX, srcY, srcZ, dirXBase, 0, 0, 163);
-    // sweepDetector(false, baseFolder.c_str(), 1, srcX, srcY, srcZ, dirXBase, 0, 0, 166);
-    // sweepDetector(false, baseFolder.c_str(), 1, srcX, srcY, srcZ, dirXBase, 0, 0, 169);
-    // sweepDetector(false, baseFolder.c_str(), 1, srcX, srcY, srcZ, dirXBase, 0, 0, 172);
-    // sweepDetector(false, baseFolder.c_str(), 1, srcX, srcY, srcZ, dirXBase, 0, 0, 175);
-    // sweepDetector(false, baseFolder.c_str(), 1, srcX, srcY, srcZ, dirXBase, 0, 0, 178);
-
-    sweepDetectorTraceOnce(false, baseFolder.c_str(), 1, srcX, srcY, srcZ, dirXBase, 0, 0);
-    sweepDetectorTraceOnce(false, baseFolder.c_str(), 1, srcX, srcY, srcZ, dirXBase, 0, 0);
-    sweepDetectorTraceOnce(false, baseFolder.c_str(), 1, srcX, srcY, srcZ, dirXBase, 0, 0);
-    sweepDetectorTraceOnce(false, baseFolder.c_str(), 1, srcX, srcY, srcZ, dirXBase, 0, 0);
-    sweepDetectorTraceOnce(false, baseFolder.c_str(), 1, srcX, srcY, srcZ, dirXBase, 0, 0);
+    int n = 5;
+    for (size_t i = 0; i < n; i++)
+    {
+        sweepDetectorTraceOnce(false, baseFolder.c_str(), 1, srcX, srcY, srcZ, dirXBase, 0, 0, portAngle);
+    }
+    
+    // Notify user when all sweeps are complete
+    std::cout << "\n***** ALL SWEEP SERIES COMPLETE *****\n" << std::endl;
+    std::cout << '\a' << std::endl;  // Sound alert
 }

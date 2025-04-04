@@ -63,10 +63,13 @@ def cosine_func(x, a, b, c):
 
 # Check command line arguments
 if len(sys.argv) < 2:
-    print("Usage: python flux_analysis.py <csv_file_or_folder>")
+    print("Usage: python flux_analysis.py <csv_file_or_folder> [average]")
     sys.exit(1)
 
 path = sys.argv[1]
+average_mode = False
+if len(sys.argv) > 2 and sys.argv[2].lower() == 'average':
+    average_mode = True
 
 # Determine if path is a file or directory
 files_to_process = []
@@ -125,20 +128,77 @@ for i, filepath in enumerate(files_to_process):
         ax.set_ylabel('θ (degrees)')
         ax.grid(True)
 
+# After processing all individual files (after the for loop for processing each file)
+# Add averaging functionality
+if average_mode and os.path.isdir(path) and len(all_data) > 1:
+    print("Averaging data across all files...")
+    
+    # Collect all data into a single DataFrame with a 'source' column
+    combined_df = pd.DataFrame()
+    for data, metadata, filename, _, _ in all_data:
+        data_copy = data.copy()
+        data_copy['source'] = filename
+        combined_df = pd.concat([combined_df, data_copy], ignore_index=True)
+    
+    # Group by theta and phi and calculate mean and standard error
+    grouped = combined_df.groupby(['theta', 'phi'])
+    avg_fractions = grouped['fraction'].mean().reset_index()
+    avg_std = grouped['fraction'].std().reset_index()
+    avg_counts = grouped.size().reset_index(name='count')
+    
+    # Merge the statistics
+    avg_data = pd.merge(avg_fractions, avg_std, on=['theta', 'phi'], suffixes=('', '_std'))
+    avg_data = pd.merge(avg_data, avg_counts, on=['theta', 'phi'])
+    avg_data['stderr'] = avg_data['fraction_std'] / np.sqrt(avg_data['count'])
+    
+    # Create a metadata entry for the average
+    avg_metadata = {
+        'BRDF Model': 'Average of all input files',
+        'Created': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'Source Files': ', '.join([f[2] for f in all_data])
+    }
+    
+    # Add to all_data with distinctive styling
+    avg_color = 'black'  # Use black for the average
+    avg_marker = 'X'     # Use X marker for the average
+    all_data.append((avg_data, avg_metadata, "AVERAGE", avg_color, avg_marker))
+
 # Now plot all theta analyses on the main figure
 plt.figure(theta_fig.number)  # Switch to theta figure
 
-for data, metadata, filename, color, marker in all_data:
-    # Get unique theta values and calculate mean fraction for each theta
-    grouped = data.groupby('theta')
-    theta_means = grouped['fraction'].mean()
-    theta_values = np.array(theta_means.index.tolist(), dtype=float)
-    fraction_means = np.array(theta_means.values, dtype=float)
+for i, (data, metadata, filename, color, marker) in enumerate(all_data):
+    # Special handling for averaged data
+    if average_mode and filename == "AVERAGE":
+        line_width = 3
+        marker_size = 10
+        alpha = 0.9
+        zorder = 10  # Draw on top
+    else:
+        line_width = 1
+        marker_size = 6
+        alpha = 0.5
+        zorder = 1
     
-    # Calculate standard errors for error bars
-    theta_std = grouped['fraction'].std().fillna(0.001)
-    theta_counts = grouped.size()
-    theta_errors = theta_std / np.sqrt(theta_counts)
+    # Get unique theta values and calculate mean fraction for each theta
+    if filename == "AVERAGE":
+        # For the average dataset, we already have the mean calculations
+        grouped = data.groupby('theta')
+        theta_values = np.array(grouped['fraction'].mean().index.tolist(), dtype=float)
+        fraction_means = np.array(grouped['fraction'].mean().values, dtype=float)
+        
+        # Error bars come from standard error across files
+        theta_errors = np.array(grouped['stderr'].mean().values, dtype=float)
+    else:
+        # Original logic for individual files
+        grouped = data.groupby('theta')
+        theta_means = grouped['fraction'].mean()
+        theta_values = np.array(theta_means.index.tolist(), dtype=float)
+        fraction_means = np.array(theta_means.values, dtype=float)
+        
+        # Calculate standard errors for error bars
+        theta_std = grouped['fraction'].std().fillna(0.001)
+        theta_counts = grouped.size()
+        theta_errors = theta_std / np.sqrt(theta_counts)
     
     # Attempt curve fitting with error handling
     try:
@@ -160,11 +220,15 @@ for data, metadata, filename, color, marker in all_data:
     theta_smooth = np.linspace(min(theta_values), max(theta_values), 1000)
     fit_curve = cosine_func(theta_smooth, *popt)
     
-    # Plot with error bars
-    plt.errorbar(theta_values, fraction_means, yerr=theta_errors, fmt=marker, color=color, 
-                 alpha=0.5, label=f'Data: {filename}', capsize=5, elinewidth=1, markeredgewidth=1)
+    # Plot with error bars - make the average plot more prominent
+    plt.errorbar(theta_values, fraction_means, yerr=theta_errors, 
+                 fmt=marker, color=color, alpha=alpha, 
+                 label=f'Data: {filename}', capsize=5, 
+                 elinewidth=1, markeredgewidth=1, 
+                 markersize=marker_size, zorder=zorder)
     
-    plt.plot(theta_smooth, fit_curve, '-', color=color, label=fit_label)
+    plt.plot(theta_smooth, fit_curve, '-', color=color, 
+             label=fit_label, linewidth=line_width, zorder=zorder)
     
     # Calculate R-squared
     residuals = fraction_means - cosine_func(theta_values, *popt)
@@ -178,32 +242,32 @@ for data, metadata, filename, color, marker in all_data:
     print(f"  R-squared value: {r_squared:.5f}")
     
     # Add exit port angle annotation if available (only for the first few files to avoid clutter)
-    if i < 3:  # Limit to first 3 files to avoid cluttering
-        if 'Exit port angle' in metadata:
-            # Extract numeric part from string like "169 degrees"
-            exit_angle_str = metadata['Exit port angle']
-            exit_angle = float(exit_angle_str.split()[0])  # Take first part before any spaces
-            calculated_angle = (180 - exit_angle) * 2
-            # Position text in upper right area of plot
-            plt.annotate(f"{filename}\nExit port angle: {exit_angle}°\nCalculated angle: {calculated_angle:.1f}°", 
-                        xy=(0.95, 0.9 - i*0.1),  # Stack vertically
-                        xycoords='axes fraction',
-                        horizontalalignment='right',
-                        verticalalignment='top',
-                        color=color,
-                        bbox=dict(boxstyle="round,pad=0.3", fc="white", ec=color, alpha=0.8))
-        elif 'Port angle' in metadata:  # Alternative key that might be used
-            # Extract numeric part from string like "169 degrees"
-            exit_angle_str = metadata['Port angle']
-            exit_angle = float(exit_angle_str.split()[0])  # Take first part before any spaces
-            calculated_angle = (180 - exit_angle) * 2
-            plt.annotate(f"{filename}\nExit port angle: {exit_angle}°\nCalculated angle: {calculated_angle:.1f}°", 
-                        xy=(0.95, 0.9 - i*0.1),  # Stack vertically
-                        xycoords='axes fraction',
-                        horizontalalignment='right',
-                        verticalalignment='top',
-                        color=color,
-                        bbox=dict(boxstyle="round,pad=0.3", fc="white", ec=color, alpha=0.8))
+    # if i < 3:  # Limit to first 3 files to avoid cluttering
+    #     if 'Exit port angle' in metadata:
+    #         # Extract numeric part from string like "169 degrees"
+    #         exit_angle_str = metadata['Exit port angle']
+    #         exit_angle = float(exit_angle_str.split()[0])  # Take first part before any spaces
+    #         calculated_angle = (180 - exit_angle) * 2
+    #         # Position text in upper right area of plot
+    #         plt.annotate(f"{filename}\nExit port angle: {exit_angle}°\nCalculated angle: {calculated_angle:.1f}°", 
+    #                     xy=(0.95, 0.9 - i*0.1),  # Stack vertically
+    #                     xycoords='axes fraction',
+    #                     horizontalalignment='right',
+    #                     verticalalignment='top',
+    #                     color=color,
+    #                     bbox=dict(boxstyle="round,pad=0.3", fc="white", ec=color, alpha=0.8))
+    #     elif 'Port angle' in metadata:  # Alternative key that might be used
+    #         # Extract numeric part from string like "169 degrees"
+    #         exit_angle_str = metadata['Port angle']
+    #         exit_angle = float(exit_angle_str.split()[0])  # Take first part before any spaces
+    #         calculated_angle = (180 - exit_angle) * 2
+    #         plt.annotate(f"{filename}\nExit port angle: {exit_angle}°\nCalculated angle: {calculated_angle:.1f}°", 
+    #                     xy=(0.95, 0.9 - i*0.1),  # Stack vertically
+    #                     xycoords='axes fraction',
+    #                     horizontalalignment='right',
+    #                     verticalalignment='top',
+    #                     color=color,
+    #                     bbox=dict(boxstyle="round,pad=0.3", fc="white", ec=color, alpha=0.8))
 
 # Set up the main theta plot
 plt.figure(theta_fig.number)
@@ -223,9 +287,12 @@ if os.path.isdir(path):
 else:
     base_filename = os.path.splitext(os.path.basename(path))[0]
 
-# theta_fig.savefig(f"{base_filename}_theta_comparison.png", dpi=300, bbox_inches='tight')
-# heatmap_grid.savefig(f"{base_filename}_heatmap_comparison.png", dpi=300, bbox_inches='tight')
-# print(f"Plots saved as {base_filename}_theta_comparison.png and {base_filename}_heatmap_comparison.png")
+if average_mode:
+    base_filename += "_averaged"
+
+theta_fig.savefig(f"{base_filename}_theta_comparison.png", dpi=300, bbox_inches='tight')
+heatmap_grid.savefig(f"{base_filename}_heatmap_comparison.png", dpi=300, bbox_inches='tight')
+print(f"Plots saved as {base_filename}_theta_comparison.png and {base_filename}_heatmap_comparison.png")
 
 # Show all plots
 plt.show()
